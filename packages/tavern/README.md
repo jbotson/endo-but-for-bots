@@ -191,6 +191,40 @@ node scripts/import-card.js --card ~/Downloads/Seraphina-v2.png --agent seraphin
 untouched. The next incoming message uses the new prompt over the **entire
 existing history** — no agent recreation, no history loss.
 
+## Switching providers or models
+
+The driver reads its LLM provider config once at startup (pinned drivers
+re-read on daemon restart), and `agent.json.model` optionally overrides the
+stored provider's model. The procedure depends on what changed.
+
+### Different model, same provider (host/auth unchanged)
+
+Edit `agent.json`'s `model` field (or re-import the card with `--model`)
+and restart — no provider re-provisioning needed:
+
+```bash
+node scripts/import-card.js --card ~/Downloads/Seraphina.png --agent seraphina --model z-ai/glm-4.7
+yarn endo stop && yarn endo start
+```
+
+Set `--model null` (or delete the `model` field from `agent.json`) to fall
+back to the stored provider's model.
+
+### Different provider (host/auth changed)
+
+Re-store the host provider config, re-bind the agent's driver to it, then
+restart:
+
+```bash
+endo store --json '{"host":"https://openrouter.ai/api/v1","model":"z-ai/glm-4.7","authToken":"sk-..."}' --name default
+yarn rebind-provider seraphina          # rewrites the driver's llm-provider binding
+yarn endo stop && yarn endo start       # revivePins() restarts the driver with the new config
+```
+
+History on disk (`tree.jsonl`, `state.json`) is untouched throughout —
+only the provider binding changes. Use `--provider <name>` if the new
+config was stored under a name other than `default`.
+
 ## Prompt resolution
 
 For each LLM call the driver assembles, from `agent.json`:
@@ -270,6 +304,7 @@ packages/tavern/
 │   ├── import-chat.js        # CLI: chat.jsonl → tree.jsonl
 │   ├── import-all.js         # CLI: both
 │   ├── create-agent.js      # CLI: TavernFactory.createAgent over the daemon
+│   ├── rebind-provider.js   # CLI: re-bind a driver to a new LLM provider
 │   └── args.js               # tiny argv parser
 └── test/                     # ava tests
 ```

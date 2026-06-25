@@ -169,20 +169,18 @@ export const spawnTavernLoop = async (
     return null;
   };
 
-  const provider =
-    providerConfig.provider ||
-    createProvider({
-      LAL_HOST: providerConfig.host,
-      LAL_MODEL: providerConfig.model,
-      LAL_AUTH_TOKEN: providerConfig.authToken,
-    });
-
-  const chat = (messages, toolSchemas) => provider.chat(messages, toolSchemas);
-
+  /**
+   * Load agent.json once at startup so `model` (an optional override of the
+   * provider's model) and `fsync` are available before the LAL provider is
+   * constructed. The system prompt / PHI / depth are re-read each turn (§4);
+   * `model` and `fsync` are startup-only and take effect on next restart.
+   */
   let fsync = false;
+  let modelOverride = null;
   try {
     const startup = await loadAgent(agentPath);
     fsync = Boolean(startup.fsync);
+    modelOverride = startup.model ?? null;
   } catch (error) {
     console.error(
       `[tavern] agent.json unreadable at startup: ${
@@ -190,6 +188,19 @@ export const spawnTavernLoop = async (
       }`,
     );
   }
+
+  // `agent.json.model` optionally overrides the stored provider's model, so a
+  // model-only switch (same host/auth) is just an edit + restart — no
+  // provider re-provisioning or driver rebinding required.
+  const provider =
+    providerConfig.provider ||
+    createProvider({
+      LAL_HOST: providerConfig.host,
+      LAL_MODEL: modelOverride || providerConfig.model,
+      LAL_AUTH_TOKEN: providerConfig.authToken,
+    });
+
+  const chat = (messages, toolSchemas) => provider.chat(messages, toolSchemas);
 
   const backend = await makeDiskBackend(treePath, { fsync });
   const tree = makeConversationTree(backend);
