@@ -2660,6 +2660,30 @@ __metadata:
   languageName: unknown
   linkType: soft
 
+"@endo/tavern@workspace:packages/tavern":
+  version: 0.0.0-use.local
+  resolution: "@endo/tavern@workspace:packages/tavern"
+  dependencies:
+    "@endo/cli": "workspace:^"
+    "@endo/conversation-tree": "workspace:^"
+    "@endo/daemon": "workspace:^"
+    "@endo/errors": "workspace:^"
+    "@endo/eventual-send": "workspace:^"
+    "@endo/exo": "workspace:^"
+    "@endo/fae": "workspace:^"
+    "@endo/far": "workspace:^"
+    "@endo/harden": "workspace:^"
+    "@endo/init": "workspace:^"
+    "@endo/lal": "workspace:^"
+    "@endo/marshal": "workspace:^"
+    "@endo/patterns": "workspace:^"
+    "@endo/promise-kit": "workspace:^"
+    "@endo/where": "workspace:^"
+    ava: "catalog:dev"
+    eslint: "catalog:dev"
+  languageName: unknown
+  linkType: soft
+
 "@endo/test262-runner@workspace:^, @endo/test262-runner@workspace:packages/test262-runner":
   version: 0.0.0-use.local
   resolution: "@endo/test262-runner@workspace:packages/test262-runner"
