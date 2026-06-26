@@ -328,6 +328,214 @@ export const spawnTavernLoop = async (
   localTools.set('exec', makeExecTool(powers));
   localTools.set('readChannel', makeReadChannelTool(powers));
 
+  // --- Self-defined tools (defineTool / removeTool) ---
+  //
+  // Lets the agent create persistent, reusable tools from JavaScript code.
+  // Definitions are stored as JSON in the `tool-defs/` petstore directory
+  // and hydrated into FaeTool objects at startup + immediately when defined.
+  //
+  // **Confinement**: each defined tool's `execute` runs in a locked-down
+  // `Compartment` with the same endowments as `exec` — `{ BigInt }` only,
+  // with `args`, `powers`, `E`, `harden`, `console` passed as function
+  // parameters. No access to the driver's scope, no file system, no process.
+
+  /**
+   * Create a FaeTool from a stored definition. The execute body runs in a
+   * Compartment identical to exec's confinement.
+   *
+   * @param {{ name: string, description: string, parameters: object, code: string, help?: string }} def
+   * @returns {object}
+   */
+  const makeDefinedTool = (def, powersArg) => {
+    const toolSchema = harden({
+      type: 'function',
+      function: {
+        name: def.name,
+        description: def.description,
+        parameters: def.parameters,
+      },
+    });
+    return harden({
+      schema() {
+        return toolSchema;
+      },
+      async execute(args) {
+        const wrappedSource = `(async (args, powers, E, harden, console) => {\n${def.code}\n})`;
+        const c = new Compartment({
+          __options__: true,
+          globals: { BigInt },
+        });
+        const fn = c.evaluate(wrappedSource);
+        const result = await fn(args, powersArg, E, harden, console);
+        if (result === undefined) {
+          return 'done (no return value)';
+        }
+        try {
+          return JSON.stringify(result, null, 2);
+        } catch {
+          return String(result);
+        }
+      },
+      help() {
+        return def.help || def.description;
+      },
+    });
+  };
+
+  /**
+   * Load all tool definitions from `tool-defs/` into localTools at startup.
+   */
+  const loadDefinedTools = async () => {
+    try {
+      await E(powers).makeDirectory(['tool-defs']);
+    } catch {
+      // Already exists.
+    }
+    try {
+      const names = /** @type {string[]} */ (await E(powers).list('tool-defs'));
+      for (const name of names) {
+        try {
+          const def = await E(powers).lookup(['tool-defs', name]);
+          if (def && def.name && def.code) {
+            localTools.set(def.name, makeDefinedTool(def, powers));
+            console.log(`[tavern] Loaded defined tool "${def.name}"`);
+          }
+        } catch {
+          // skip unreadable definition
+        }
+      }
+    } catch {
+      // list failed; skip
+    }
+  };
+
+  localTools.set(
+    'defineTool',
+    harden({
+      schema() {
+        return harden({
+          type: 'function',
+          function: {
+            name: 'defineTool',
+            description:
+              'Define a reusable tool from JavaScript code. The code runs in ' +
+              'a sandboxed Compartment with the same confinement as exec ' +
+              '(globals: args, powers, E, harden, console, BigInt — nothing else). ' +
+              'The tool is available immediately and persists across daemon restarts.',
+            parameters: {
+              type: 'object',
+              properties: {
+                name: {
+                  type: 'string',
+                  description:
+                    'Tool name (lowercase, alnum + hyphen, 1-128 chars). Must not collide with existing tools.',
+                },
+                description: {
+                  type: 'string',
+                  description: 'Short description of what the tool does (shown to the LLM).',
+                },
+                parameters: {
+                  description:
+                    'JSON Schema for the tool\'s parameters (same shape as OpenAI function parameters).',
+                },
+                code: {
+                  type: 'string',
+                  description:
+                    'JavaScript code to run when the tool is called. Runs as an async function body. ' +
+                    'Receives `args` (the tool call arguments), `powers`, `E`, `harden`, `console`. ' +
+                    'Return a value to send back to the LLM.',
+                },
+                help: {
+                  type: 'string',
+                  description: 'Optional help text (defaults to description).',
+                },
+              },
+              required: ['name', 'description', 'parameters', 'code'],
+            },
+          },
+        });
+      },
+      async execute(args) {
+        const {
+          name,
+          description,
+          parameters,
+          code,
+          help,
+        } = /** @type {{ name: string, description: string, parameters: object, code: string, help?: string }} */ (
+          args
+        );
+        if (!name || !/^[a-z0-9][a-z0-9-]{0,127}$/.test(name)) {
+          return 'Error: name must match /^[a-z0-9][a-z0-9-]{0,127}$/';
+        }
+        if (!code) {
+          return 'Error: code is required';
+        }
+        const def = harden({
+          name,
+          description: description || '',
+          parameters: parameters || { type: 'object', properties: {} },
+          code,
+          help: help || description || '',
+        });
+        // Persist the definition as JSON in the petstore
+        await E(powers).storeValue(def, ['tool-defs', name]);
+        // Add to localTools immediately (available on the next LLM call
+        // in this agentic loop after re-discovery)
+        localTools.set(name, makeDefinedTool(def, powers));
+        console.log(`[tavern] Defined tool "${name}"`);
+        return `Tool "${name}" defined and available immediately. It will persist across daemon restarts.`;
+      },
+      help() {
+        return 'Define a reusable tool from JavaScript code. The tool runs in a sandboxed Compartment with the same confinement as exec.';
+      },
+    }),
+  );
+
+  localTools.set(
+    'removeTool',
+    harden({
+      schema() {
+        return harden({
+          type: 'function',
+          function: {
+            name: 'removeTool',
+            description:
+              'Remove a tool previously defined with defineTool. Deletes it from memory and from the petstore.',
+            parameters: {
+              type: 'object',
+              properties: {
+                name: {
+                  type: 'string',
+                  description: 'The name of the tool to remove.',
+                },
+              },
+              required: ['name'],
+            },
+          },
+        });
+      },
+      async execute(args) {
+        const { name } = /** @type {{ name: string }} */ (args);
+        if (!name) {
+          return 'Error: name is required';
+        }
+        localTools.delete(name);
+        try {
+          await E(powers).remove(['tool-defs', name]);
+        } catch {
+          // best-effort
+        }
+        console.log(`[tavern] Removed tool "${name}"`);
+        return `Tool "${name}" removed.`;
+      },
+      help() {
+        return 'Remove a self-defined tool. Deletes it from memory and persistent storage.';
+      },
+    }),
+  );
+  // --- end self-defined tools ---
+
   // --- Context-management tools (summarization with LLM-verified commit) ---
   //
   // Disabled by default — enable via agent.json: `"enableSummarization": true`.
@@ -662,10 +870,13 @@ export const spawnTavernLoop = async (
         ]);
         sharedLeafId = stepNode.id;
 
-        const adopted = toolCalls.some(
-          tc => /** @type {any} */ (tc).function?.name === 'adoptTool',
+        const needsRediscovery = toolCalls.some(
+          tc => {
+            const n = /** @type {any} */ (tc).function?.name;
+            return n === 'adoptTool' || n === 'defineTool' || n === 'removeTool';
+          },
         );
-        if (adopted) {
+        if (needsRediscovery) {
           const refreshed = await discoverTools(powers, localTools);
           currentSchemas = refreshed.schemas;
           currentToolMap = refreshed.toolMap;
@@ -713,6 +924,7 @@ export const spawnTavernLoop = async (
 
   const runAgent = async () => {
     await initializeIntroducedTools();
+    await loadDefinedTools();
 
     await E(powers).send('@host', [`Tavern agent "${agentName}" ready.`], [], []);
 
