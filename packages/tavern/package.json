@@ -29,6 +29,7 @@
     "create-agent": "node scripts/create-agent.js",
     "rebind-provider": "node scripts/rebind-provider.js",
     "destroy-agent": "node scripts/destroy-agent.js",
+    "grant-scheduling": "node scripts/grant-scheduling.js",
     "import-card": "node scripts/import-card.js",
     "import-chat": "node scripts/import-chat.js",
     "import-all": "node scripts/import-all.js",

@@ -7,6 +7,7 @@ import fsp from 'node:fs/promises';
 import { makeExo } from '@endo/exo';
 import { M } from '@endo/patterns';
 import { E } from '@endo/eventual-send';
+import { Far } from '@endo/far';
 import { passableAsJustin, makeMarshal } from '@endo/marshal';
 import { makeRefIterator } from '@endo/daemon/ref-reader.js';
 import { createProvider } from '@endo/lal/providers/index.js';
@@ -37,6 +38,7 @@ import {
   loadState,
   saveState,
   saveJson,
+  loadJson,
   CONTEXT_DEFAULTS,
 } from './src/agent-state.js';
 
@@ -225,6 +227,8 @@ harden(buildDirective);
  * @param {object} [factoryRef] - the TavernFactory ref, for spawning/tearing
  *   down probe sub-agents during summary verification (may be `undefined` in
  *   tests where probes are mocked).
+ * @param {object} [hostRef] - the EndoHost ref, for `makeTimer`/`cancel`
+ *   (the agent's EndoGuest doesn't expose these). May be `undefined` in tests.
  * @returns {Promise<void>}
  */
 export const spawnTavernLoop = async (
@@ -234,6 +238,7 @@ export const spawnTavernLoop = async (
   stateDir,
   agentName,
   factoryRef,
+  hostRef,
 ) => {
   const treePath = path.join(stateDir, 'tree.jsonl');
   const agentPath = path.join(stateDir, 'agent.json');
@@ -385,27 +390,43 @@ export const spawnTavernLoop = async (
   /**
    * Load all tool definitions from `tool-defs/` into localTools at startup.
    */
+  /**
+   * Load all tool definitions from `<stateDir>/tool-defs/<name>.json` into
+   * localTools at startup. Stored on the host filesystem (not the petstore)
+   * because the driver is --UNCONFINED and this is more robust: survives GC,
+   * petstore issues, and is inspectable by the user.
+   */
+  const toolDefsDir = path.join(stateDir, 'tool-defs');
+
   const loadDefinedTools = async () => {
     try {
-      await E(powers).makeDirectory(['tool-defs']);
+      await fsp.mkdir(toolDefsDir, { recursive: true });
     } catch {
-      // Already exists.
+      // already exists
     }
+    let files;
     try {
-      const names = /** @type {string[]} */ (await E(powers).list('tool-defs'));
-      for (const name of names) {
+      files = await fsp.readdir(toolDefsDir);
+    } catch {
+      // dir doesn't exist or unreadable — no defined tools to load
+      return;
+    }
+    for (const file of files) {
+      if (file.endsWith('.json')) {
         try {
-          const def = await E(powers).lookup(['tool-defs', name]);
+          const text = await fsp.readFile(path.join(toolDefsDir, file), 'utf8');
+          const def = JSON.parse(text);
           if (def && def.name && def.code) {
             localTools.set(def.name, makeDefinedTool(def, powers));
             console.log(`[tavern] Loaded defined tool "${def.name}"`);
           }
-        } catch {
-          // skip unreadable definition
+        } catch (err) {
+          console.error(
+            `[tavern] Error loading tool def "${file}":`,
+            err instanceof Error ? err.message : String(err),
+          );
         }
       }
-    } catch {
-      // list failed; skip
     }
   };
 
@@ -471,15 +492,15 @@ export const spawnTavernLoop = async (
         if (!code) {
           return 'Error: code is required';
         }
-        const def = harden({
-          name,
-          description: description || '',
-          parameters: parameters || { type: 'object', properties: {} },
-          code,
-          help: help || description || '',
-        });
-        // Persist the definition as JSON in the petstore
-        await E(powers).storeValue(def, ['tool-defs', name]);
+        const def = { name, description: description || '', parameters: parameters || { type: 'object', properties: {} }, code, help: help || description || '' };
+        // Persist as JSON on the host filesystem (not the petstore) — more
+        // robust: survives GC, petstore issues, and is inspectable.
+        await fsp.mkdir(toolDefsDir, { recursive: true });
+        await fsp.writeFile(
+          path.join(toolDefsDir, `${name}.json`),
+          JSON.stringify(def, null, 2),
+          'utf8',
+        );
         // Add to localTools immediately (available on the next LLM call
         // in this agentic loop after re-discovery)
         localTools.set(name, makeDefinedTool(def, powers));
@@ -501,7 +522,7 @@ export const spawnTavernLoop = async (
           function: {
             name: 'removeTool',
             description:
-              'Remove a tool previously defined with defineTool. Deletes it from memory and from the petstore.',
+              'Remove a tool previously defined with defineTool. Deletes it from memory and from disk.',
             parameters: {
               type: 'object',
               properties: {
@@ -522,7 +543,7 @@ export const spawnTavernLoop = async (
         }
         localTools.delete(name);
         try {
-          await E(powers).remove(['tool-defs', name]);
+          await fsp.rm(path.join(toolDefsDir, `${name}.json`), { force: true });
         } catch {
           // best-effort
         }
@@ -535,6 +556,293 @@ export const spawnTavernLoop = async (
     }),
   );
   // --- end self-defined tools ---
+
+  // --- Scheduled jobs (createSchedule / removeSchedule) ---
+  //
+  // Lets the agent schedule periodic "cron-style" jobs that wake it up with
+  // an inbox message at a configured interval (minimum 60s — this is for
+  // a few-times-a-day scheduling, not sub-second timers).
+  //
+  // Built on the daemon's makeTimer, but bridges the timer's callback-based
+  // onTick into an actual inbox message, so the agent's followMessages loop
+  // receives the tick naturally as a new turn.
+
+  /**
+   * In-memory map of jobName → schedule info (timerPetName, message, interval,
+   * label). Persisted to schedules.json so schedules survive driver restarts;
+   * on restart, loadSchedules re-subscribes to the timers and fires one
+   * catch-up tick if a scheduled tick was missed during downtime.
+   *
+   * @type {Map<string, { timerPetName: string, message: string, intervalMs: number, label: string, lastRun: string | null }>}
+   */
+  const scheduledJobs = new Map();
+
+  const schedulesPath = path.join(stateDir, 'schedules.json');
+
+  /**
+   * Persist the current set of scheduled jobs to `schedules.json`.
+   * This file is read at startup to re-subscribe to timers after restart.
+   *
+   * @param {Map<string, { timerPetName: string, message: string, intervalMs: number, label: string }>} jobs
+   */
+  const saveSchedules = async jobs => {
+    const entries = [];
+    for (const [jobName, info] of jobs) {
+      entries.push({ jobName, ...info });
+    }
+    await saveJson(schedulesPath, entries);
+  };
+
+  /**
+   * Update lastRun for a job and persist.
+   *
+   * @param {string} jobName
+   */
+  const touchSchedule = async jobName => {
+    const info = scheduledJobs.get(jobName);
+    if (info) {
+      info.lastRun = new Date().toISOString();
+      await saveSchedules(scheduledJobs);
+    }
+  };
+
+  /**
+   * Load schedules.json and re-subscribe to existing timers. For each schedule,
+   * fire one catch-up tick if the timer already exists (meaning the daemon was
+   * running and the schedule was missed since the driver last restarted).
+   * If the timer no longer exists (e.g. cancelled while driver was down), the
+   * schedule is dropped silently.
+   *
+   * @param {object} hostRefArg - the narrowed TimerHost exo (from driver)
+   * @param {object} powersArg - the agent's EndoGuest powers
+   */
+  const loadSchedules = async (hostRefArg, powersArg) => {
+    if (!hostRefArg) return;
+    const data = await loadJson(schedulesPath);
+    if (!data || !Array.isArray(data) || data.length === 0) return;
+
+    const now = Date.now();
+    const loaded = new Map();
+    for (const entry of data) {
+      const { jobName, timerPetName, message, intervalMs, label } = entry;
+
+      try {
+        // Check if the timer still exists. If it was cancelled while the
+        // driver was down, this throws and we drop the schedule.
+        const timer = await E(hostRefArg).lookup([timerPetName]);
+
+        // Re-subscribe with the same Far callback pattern as createSchedule.
+        const subscriber = Far('ScheduleSubscriber', {
+          async onTick(tick) {
+            const tickMessage = `[Scheduled job "${jobName}" tick #${tick.tick} at ${tick.timestamp}]\n${message}`;
+            try {
+              await E(powersArg).send('@self', [tickMessage], [], []);
+            } catch (err) {
+              console.error(
+                `[tavern] schedule "${jobName}" tick failed:`,
+                err instanceof Error ? err.message : String(err),
+              );
+            }
+            touchSchedule(jobName).catch(() => {});
+          },
+        });
+        await E(timer).subscribe(subscriber);
+
+        const lastRun = entry.lastRun || null;
+        loaded.set(jobName, { timerPetName, message, intervalMs, label, lastRun });
+        scheduledJobs.set(jobName, { timerPetName, message, intervalMs, label, lastRun });
+        console.log(`[tavern] Restored schedule "${jobName}" (every ${intervalMs / 60_000} min)`);
+
+        // Single catch-up: if the schedule was last run before now and the
+        // next due time has passed, fire one immediate catch-up tick. We
+        // don't fire multiple catch-ups for multiple missed ticks.
+        const lastRunMs = lastRun ? new Date(lastRun).getTime() : 0;
+        const nextDue = lastRunMs + intervalMs;
+        if (nextDue < now && lastRunMs > 0) {
+          const catchupTimestamp = new Date(now).toISOString();
+          console.log(`[tavern] Firing catch-up tick for schedule "${jobName}"`);
+          try {
+            await E(powersArg).send('@self', [
+              `[Scheduled job "${jobName}" catch-up tick at ${catchupTimestamp}]\n${message}`,
+            ], [], []);
+          } catch {
+            // best-effort
+          }
+        }
+      } catch {
+        // Timer no longer exists — drop the schedule silently.
+        console.log(`[tavern] Schedule "${jobName}" timer no longer exists; dropping`);
+      }
+    }
+    // Save the restored set (without lastRun — it'll be updated on next tick)
+    await saveSchedules(loaded);
+  };
+
+  localTools.set(
+    'createSchedule',
+    harden({
+      schema() {
+        return harden({
+          type: 'function',
+          function: {
+            name: 'createSchedule',
+            description:
+              'Schedule a recurring job that sends you an inbox message at a ' +
+              'specified interval. Use this for periodic tasks (e.g. checking ' +
+              'on something a few times a day), not sub-second timers. The ' +
+              'minimum interval is 60 seconds. The job persists across daemon ' +
+              'restarts. Use removeSchedule to cancel.',
+            parameters: {
+              type: 'object',
+              properties: {
+                jobName: {
+                  type: 'string',
+                  description:
+                    'A short name for the job (lowercase, alnum + hyphen). Used to identify the job later.',
+                },
+                intervalMinutes: {
+                  type: 'number',
+                  description:
+                    'Interval between messages in minutes. Minimum 1 (60 seconds).',
+                },
+                message: {
+                  type: 'string',
+                  description:
+                    'The message text to send to your inbox on each tick. ' +
+                    'This is what you (the agent) will receive as a new conversation turn.',
+                },
+                label: {
+                  type: 'string',
+                  description: 'Optional human-readable label for the timer (defaults to jobName).',
+                },
+              },
+              required: ['jobName', 'intervalMinutes', 'message'],
+            },
+          },
+        });
+      },
+      async execute(args) {
+        const {
+          jobName,
+          intervalMinutes,
+          message,
+          label,
+        } = /** @type {{ jobName: string, intervalMinutes: number, message: string, label?: string }} */ (
+          args
+        );
+        if (!jobName || !/^[a-z0-9][a-z0-9-]{0,127}$/.test(jobName)) {
+          return 'Error: jobName must match /^[a-z0-9][a-z0-9-]{0,127}$/';
+        }
+        if (!message) {
+          return 'Error: message is required';
+        }
+        const minutes = Number(intervalMinutes);
+        if (!Number.isFinite(minutes) || minutes < 1) {
+          return 'Error: intervalMinutes must be a number >= 1 (60 second minimum)';
+        }
+        if (!hostRef) {
+          return 'Error: host ref not available — cannot create timers in this mode.';
+        }
+        const intervalMs = Math.round(minutes * 60 * 1000);
+        const timerLabel = label || jobName;
+        const timerPetName = `schedule-${jobName}`;
+
+        try {
+          // makeTimer/cancel are on EndoHost, not EndoGuest — use the host ref.
+          await E(hostRef).makeTimer(timerPetName, intervalMs, timerLabel);
+          const timer = await E(hostRef).lookup([timerPetName]);
+
+          // Subscribe a callback that sends an inbox message to @self on
+          // each tick. The GC keeps this alive while the timer formula
+          // holds the reference (the timer is a persistent formula).
+          const subscriber = Far('ScheduleSubscriber', {
+            async onTick(tick) {
+              const tickMessage = `[Scheduled job "${jobName}" tick #${tick.tick} at ${tick.timestamp}]\n${message}`;
+              try {
+                await E(powers).send('@self', [tickMessage], [], []);
+              } catch (err) {
+                console.error(
+                  `[tavern] schedule "${jobName}" tick failed:`,
+                  err instanceof Error ? err.message : String(err),
+                );
+              }
+              // Update lastRun so the next restart knows whether a catch-up
+              // is needed.
+              touchSchedule(jobName).catch(() => {});
+            },
+          });
+          await E(timer).subscribe(subscriber);
+
+          scheduledJobs.set(jobName, { timerPetName, message, intervalMs, label: timerLabel, lastRun: null });
+          // Persist all current schedules to schedules.json so the driver can
+          // restore them on restart.
+          await saveSchedules(scheduledJobs);
+          console.log(`[tavern] Scheduled job "${jobName}" every ${minutes} min`);
+          return `Schedule "${jobName}" created: you will receive "${message}" every ${minutes} minute(s). Use removeSchedule("${jobName}") to cancel.`;
+        } catch (err) {
+          return `Failed to create schedule: ${err instanceof Error ? err.message : String(err)}`;
+        }
+      },
+      help() {
+        return 'Schedule a recurring job that sends an inbox message at a specified interval (minimum 60s). Persists across restarts. Use removeSchedule to cancel.';
+      },
+    }),
+  );
+
+  localTools.set(
+    'removeSchedule',
+    harden({
+      schema() {
+        return harden({
+          type: 'function',
+          function: {
+            name: 'removeSchedule',
+            description:
+              'Cancel a scheduled job previously created with createSchedule. ' +
+              'Cancels the underlying daemon timer and stops further tick messages.',
+            parameters: {
+              type: 'object',
+              properties: {
+                jobName: {
+                  type: 'string',
+                  description: 'The job name to cancel.',
+                },
+              },
+              required: ['jobName'],
+            },
+          },
+        });
+      },
+      async execute(args) {
+        const { jobName } = /** @type {{ jobName: string }} */ (args);
+        if (!jobName) {
+          return 'Error: jobName is required';
+        }
+        const info = scheduledJobs.get(jobName);
+        const timerPetName = info ? info.timerPetName : `schedule-${jobName}`;
+        scheduledJobs.delete(jobName);
+        // Persist the updated set (without this job).
+        await saveSchedules(scheduledJobs);
+        const host = hostRef || powers;
+        try {
+          await E(host).cancel(timerPetName);
+        } catch {
+          // already cancelled or never existed
+        }
+        try {
+          await E(host).remove(timerPetName);
+        } catch {
+          // best-effort
+        }
+        console.log(`[tavern] Removed schedule "${jobName}"`);
+        return `Schedule "${jobName}" cancelled.`;
+      },
+      help() {
+        return 'Cancel a scheduled job. Stops further tick messages and cancels the daemon timer.';
+      },
+    }),
+  );
+  // --- end scheduled jobs ---
 
   // --- Context-management tools (summarization with LLM-verified commit) ---
   //
@@ -873,7 +1181,8 @@ export const spawnTavernLoop = async (
         const needsRediscovery = toolCalls.some(
           tc => {
             const n = /** @type {any} */ (tc).function?.name;
-            return n === 'adoptTool' || n === 'defineTool' || n === 'removeTool';
+            return n === 'adoptTool' || n === 'defineTool' || n === 'removeTool'
+              || n === 'createSchedule' || n === 'removeSchedule';
           },
         );
         if (needsRediscovery) {
@@ -903,6 +1212,7 @@ export const spawnTavernLoop = async (
     }
     try {
       const topNames = /** @type {string[]} */ (await E(powers).list());
+      console.log(`[tavern] top-level petnames: ${topNames.join(', ') || '(none)'}`);
       for (const name of topNames) {
         if (name !== 'tools' && !specialNamePattern.test(name)) {
           try {
@@ -917,14 +1227,18 @@ export const spawnTavernLoop = async (
           }
         }
       }
-    } catch {
-      // list() failed; skip initialization.
+    } catch (err) {
+      console.error(
+        '[tavern] initializeIntroducedTools: list() failed:',
+        err instanceof Error ? err.message : String(err),
+      );
     }
   };
 
   const runAgent = async () => {
     await initializeIntroducedTools();
     await loadDefinedTools();
+    await loadSchedules(hostRef, powers);
 
     await E(powers).send('@host', [`Tavern agent "${agentName}" ready.`], [], []);
 
@@ -1001,6 +1315,7 @@ export const spawnTavernLoop = async (
             powers,
             localTools,
           );
+          console.log(`[tavern] ${toolSchemas.length} tools available (${[...toolMap.keys()].join(', ')})`);
 
           let textContent;
           if (type === 'package' && Array.isArray(strings)) {
@@ -1164,6 +1479,38 @@ harden(spawnTavernLoop);
 const driverSpecifier = new URL('driver.js', import.meta.url).href;
 
 /**
+ * A narrowed facet over EndoHost that exposes ONLY the timer-related methods
+ * the schedule tools need: makeTimer, lookup, cancel, remove. This prevents
+ * the agent from gaining broader host powers (provideGuest, makeUnconfined,
+ * etc.) through the schedule capability. Exported so the grant-scheduling
+ * script can create the same narrowed facet for existing agents.
+ */
+const TimerHostInterface = M.interface('TimerHost', {
+  makeTimer: M.call(M.string(), M.number())
+    .optional(M.string())
+    .returns(M.promise()),
+  lookup: M.call(M.any()).returns(M.promise()),
+  cancel: M.call(M.any()).optional(M.any()).returns(M.promise()),
+  remove: M.call(M.any()).returns(M.promise()),
+});
+
+export const makeTimerHost = hostRef =>
+  makeExo('TimerHost', TimerHostInterface, {
+    makeTimer(petName, intervalMs, label) {
+      return E(hostRef).makeTimer(petName, intervalMs, label);
+    },
+    lookup(namePath) {
+      return E(hostRef).lookup(namePath);
+    },
+    cancel(name, reason) {
+      return E(hostRef).cancel(name, reason);
+    },
+    remove(name) {
+      return E(hostRef).remove(name);
+    },
+  });
+
+/**
  * Creates a Tavern factory that provisions agent instances bound to a named
  * LLM provider. `createAgent(name, { stateDir, providerName?, pin? })` does
  * NOT take a system prompt — the prompt lives on disk in `agent.json`, which
@@ -1249,6 +1596,14 @@ export const make = async (guestPowers, _context) => {
       // can spawn/tear down probe sub-agents via the factory.
       const factoryLocator = await E(powers).locate('@self');
       await E(driverPowers).storeLocator('tavern-factory', factoryLocator);
+
+      // Store the raw host-agent identifier in the driver's petstore.
+      // The driver narrows it to TimerHost at startup (makeTimerHost) so the
+      // schedule tools can't reach broader host powers (provideGuest,
+      // makeUnconfined, etc.). The agent can't lookup('host-agent') — it's
+      // in the DRIVER's petstore, not the agent's.
+      const hostAgentId = await E(powers).identify('host-agent');
+      await E(driverPowers).storeIdentifier('host-agent', hostAgentId);
 
       // 4. Launch the driver caplet, passing the disk state dir + agent name
       //    via env so it can reload agent.json / tree.jsonl each turn.

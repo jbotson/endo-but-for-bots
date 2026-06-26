@@ -2,7 +2,7 @@
 import { E } from '@endo/eventual-send';
 import { Far } from '@endo/far';
 
-import { spawnTavernLoop } from './agent.js';
+import { spawnTavernLoop, makeTimerHost } from './agent.js';
 
 /**
  * Tavern agent driver caplet.
@@ -51,6 +51,18 @@ export const make = async (powers, context, { env } = {}) => {
     } catch {
       factoryRef = undefined;
     }
+    // host-agent is the raw EndoHost ref, stored by createAgent or
+    // grant-scheduling. May be absent in tests or older deployments.
+    // Narrow it to TimerHost (makeTimer/lookup/cancel/remove only) so the
+    // schedule tools can't reach broader host powers. The agent can't
+    // lookup('host-agent') — it's in the DRIVER's petstore, not the agent's.
+    let hostRef;
+    try {
+      const rawHost = await E(powers).lookup('host-agent');
+      hostRef = makeTimerHost(rawHost);
+    } catch {
+      hostRef = undefined;
+    }
     await spawnTavernLoop(
       agentPowers,
       context,
@@ -58,6 +70,7 @@ export const make = async (powers, context, { env } = {}) => {
       stateDir,
       agentName,
       factoryRef,
+      hostRef,
     );
   };
 
