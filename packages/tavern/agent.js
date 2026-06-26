@@ -861,6 +861,8 @@ export const spawnTavernLoop = async (
   let stagedSummary = null;
   /** @type {Map<string, string>} */
   const probeLocators = new Map();
+  /** @type {Map<string, string>} probe petname → probe stateDir */
+  const probeDirs = new Map();
 
   if (enableSummarization) {
   /**
@@ -874,6 +876,7 @@ export const spawnTavernLoop = async (
     if (locator) {
       probeLocators.delete(locator[0]);
     }
+    probeDirs.delete(probeName);
     // Best-effort teardown — probes are never pinned, so a stale probe is
     // harmless if teardown fails; the destroy-agent CLI can clean up later.
     try {
@@ -994,11 +997,94 @@ export const spawnTavernLoop = async (
         const probeLocator = await E(factoryRef).locateAgent(probeName);
         await E(powers).storeLocator(probeName, probeLocator);
         probeLocators.set(probeLocator, probeName);
+        probeDirs.set(probeName, probeDir);
 
-        return `Probe agent "${probeName}" spawned (profile: ${profileName}). It will announce when ready. Use send(to: "${probeName}", strings: ["your question"]) to verify the summary. When satisfied, call commitSummary; to retry, call discardSummary. Either will tear down the probe.`;
+        return `Probe agent "${probeName}" spawned (profile: ${profileName}). It will announce when ready. Use send(to: "${probeName}", strings: ["your question"]) to verify the summary, then readProbeTrace to inspect its full thinking. When satisfied, call commitSummary; to retry, call discardSummary. Either will tear down the probe.`;
       },
       help() {
         return 'Spawn a transient verification sub-agent whose context is only your staged summary. Send it questions to check persona retention.';
+      },
+    }),
+  );
+
+  localTools.set(
+    'readProbeTrace',
+    harden({
+      schema() {
+        return harden({
+          type: 'function',
+          function: {
+            name: 'readProbeTrace',
+            description:
+              'Read the full conversation trace of a probe sub-agent — every LLM call, ' +
+              'tool call, and tool result, not just the final reply. Use this after sending ' +
+              'a question to the probe (via send) to inspect whether the probe\'s personality ' +
+              'and reasoning match the original character. The probe may still be running when ' +
+              'you call this; you get its trace so far. Call multiple times to see updates.',
+            parameters: {
+              type: 'object',
+              properties: {
+                probeName: {
+                  type: 'string',
+                  description: 'The probe agent name (returned by spawnProbeAgent).',
+                },
+              },
+              required: ['probeName'],
+            },
+          },
+        });
+      },
+      async execute(args) {
+        const { probeName } = /** @type {{ probeName: string }} */ (args);
+        if (!probeName) {
+          return 'Error: probeName is required';
+        }
+        const probeDir = probeDirs.get(probeName);
+        if (!probeDir) {
+          return `Error: unknown probe "${probeName}". Use the name returned by spawnProbeAgent.`;
+        }
+        const probeTreePath = path.join(probeDir, 'tree.jsonl');
+        let text;
+        try {
+          text = await fsp.readFile(probeTreePath, 'utf8');
+        } catch {
+          return `Probe "${probeName}" has no conversation trace yet (it may still be starting up).`;
+        }
+        const lines = text.split('\n').filter(l => l.trim().length > 0);
+        if (lines.length === 0) {
+          return `Probe "${probeName}" has no conversation trace yet.`;
+        }
+        const parts = [];
+        for (const line of lines) {
+          try {
+            const node = JSON.parse(line);
+            for (const msg of node.messages) {
+              const role = msg.role || 'unknown';
+              if (msg.content) {
+                parts.push(`[${role}] ${msg.content}`);
+              }
+              if (Array.isArray(msg.tool_calls)) {
+                for (const tc of msg.tool_calls) {
+                  const fn = tc.function || {};
+                  parts.push(`[tool_call] ${fn.name}(${typeof fn.arguments === 'string' ? fn.arguments : JSON.stringify(fn.arguments)})`);
+                }
+              }
+              if (msg.tool_call_id && msg.content) {
+                parts.push(`[tool_result] ${msg.content}`);
+              }
+            }
+          } catch {
+            // skip unparseable
+          }
+        }
+        const trace = parts.join('\n');
+        if (!trace) {
+          return `Probe "${probeName}" trace is empty.`;
+        }
+        return `=== Probe "${probeName}" trace (${lines.length} nodes) ===\n${trace}`;
+      },
+      help() {
+        return 'Read the full conversation trace of a probe sub-agent (all LLM calls, tool calls, and results).';
       },
     }),
   );

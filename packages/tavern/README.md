@@ -256,6 +256,7 @@ Four tools are available to the agent every turn:
 |------|-------------|
 | `draftSummary` | Stage a summary text in memory (replaces any prior draft). |
 | `spawnProbeAgent` | Spawn a transient sub-agent whose system prompt is only the staged summary. Send it questions via `send` to verify persona retention. |
+| `readProbeTrace` | Read the full conversation trace of a probe sub-agent — every LLM call, tool call, and tool result, not just the final reply. |
 | `commitSummary` | Append the summary as a new effective root in the tree. Older turns are omitted from future context (but retained on disk). Auto-tears-down the probe. |
 | `discardSummary` | Drop the staged draft and tear down the probe. Use to retry. |
 
