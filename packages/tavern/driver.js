@@ -42,12 +42,22 @@ export const make = async (powers, context, { env } = {}) => {
       await E(powers).lookup('llm-provider')
     );
     const agentPowers = await E(powers).lookup('agent');
+    // tavern-factory is stored by createAgent; may be absent in tests or if
+    // the factory was created before this feature. spawnTavernLoop tolerates
+    // undefined (summary tools that need it will just return an error).
+    let factoryRef;
+    try {
+      factoryRef = await E(powers).lookup('tavern-factory');
+    } catch {
+      factoryRef = undefined;
+    }
     await spawnTavernLoop(
       agentPowers,
       context,
       providerConfig,
       stateDir,
       agentName,
+      factoryRef,
     );
   };
 

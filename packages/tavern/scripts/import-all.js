@@ -58,6 +58,19 @@ const main = async () => {
         ? flags.model
         : null,
     fsync: flags.fsync === true,
+    contextBudgetTokens:
+      typeof flags['context-budget'] === 'string'
+        ? Number(flags['context-budget'])
+        : undefined,
+    summarizeAtRatio:
+      typeof flags['summarize-at'] === 'string'
+        ? Number(flags['summarize-at'])
+        : undefined,
+    summarizeDirective:
+      typeof flags['summarize-directive'] === 'string'
+        ? flags['summarize-directive']
+        : undefined,
+    enableSummarization: flags['enable-summarization'] === true,
   });
 
   if (chat) {

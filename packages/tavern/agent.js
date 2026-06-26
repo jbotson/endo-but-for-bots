@@ -2,6 +2,7 @@
 /* eslint-disable no-await-in-loop, @endo/restrict-comparison-operands */
 
 import path from 'node:path';
+import fsp from 'node:fs/promises';
 
 import { makeExo } from '@endo/exo';
 import { M } from '@endo/patterns';
@@ -35,6 +36,8 @@ import {
   loadAgent,
   loadState,
   saveState,
+  saveJson,
+  CONTEXT_DEFAULTS,
 } from './src/agent-state.js';
 
 /** Same pattern as isSpecialName in packages/daemon/src/pet-name.js */
@@ -51,6 +54,8 @@ const TavernFactoryInterface = M.interface('TavernFactory', {
   createAgent: M.callWhen(M.string())
     .optional(M.record())
     .returns(M.string()),
+  destroyAgent: M.callWhen(M.string()).returns(M.string()),
+  locateAgent: M.call(M.string()).returns(M.promise()),
   help: M.call().optional(M.string()).returns(M.string()),
 });
 
@@ -62,6 +67,10 @@ const TavernFactoryInterface = M.interface('TavernFactory', {
  * @property {boolean} [fsync]
  * @property {{ name: string }} [provider]
  * @property {string | null} [model]
+ * @property {number} [contextBudgetTokens]
+ * @property {number} [summarizeAtRatio]
+ * @property {string} [summarizeDirective]
+ * @property {boolean} [enableSummarization]
  */
 
 /**
@@ -78,9 +87,8 @@ const TavernFactoryInterface = M.interface('TavernFactory', {
  */
 const assembleContext = (cfg, pathMessages) => {
   const msgs = pathMessages.slice();
-  while (msgs.length > 0 && msgs[0].role === 'system') {
-    msgs.shift();
-  }
+  // No stripping here — getEffectivePath already handles portability-root
+  // vs. summary boundaries. The agent.json system prompt is authoritative.
   const out = [{ role: 'system', content: cfg.systemPrompt }, ...msgs];
 
   const dp = cfg.depthPrompt;
@@ -117,6 +125,77 @@ const resolveCurrentLeaf = async tree => {
 };
 
 /**
+ * Walk the node chain from leaf → root and collect messages, but stop when
+ * a summary node is reached — the summary *becomes* the effective root.
+ * This is what `assembleContext` consumes instead of the raw `tree.getPath`,
+ * so that committed summaries prevent the context window from growing
+ * unbounded without destroying history on disk.
+ *
+ * @param {import('./src/types.js').ConversationTree} tree
+ * @param {string} leafId
+ * @returns {Promise<object[]>}
+ */
+const getEffectivePath = async (tree, leafId) => {
+  const chain = [];
+  let cursor = leafId;
+  while (cursor !== null && cursor !== undefined) {
+    const node = await tree.getNode(cursor);
+    if (node === null) break;
+    chain.push(node);
+    if (node.metadata && node.metadata.summary) {
+      break; // summary node becomes the effective root
+    }
+    cursor = node.parentId;
+  }
+  chain.reverse();
+  const messages = [];
+  for (let i = 0; i < chain.length; i += 1) {
+    const node = chain[i];
+    // Skip the import-time portability root's system message: it's the root
+    // (parentId === null), not a summary, and its messages are all system.
+    // The live system prompt comes from agent.json (assembled by
+    // assembleContext), never from this stored root (§4.1).
+    if (
+      node.parentId === null &&
+      !(node.metadata && node.metadata.summary) &&
+      node.messages.every(msg => msg.role === 'system')
+    ) {
+      /* skip portability root — agent.json system prompt is authoritative */
+    } else {
+      messages.push(...node.messages);
+    }
+  }
+  return messages;
+};
+
+/**
+ * Rough token estimate: ~4 chars per token. Not tokenizer-accurate, but
+ * sufficient for triggering the 'consider summarizing' directive. The LLM
+ * self-verifies the summary via probe before committing.
+ *
+ * @param {object[]} messages
+ * @returns {number}
+ */
+const estimateTokens = messages => {
+  return Math.ceil(JSON.stringify(messages).length / 4);
+};
+
+/**
+ * Substitute placeholders in the configurable directive template.
+ *
+ * @param {string} template
+ * @param {number} estTokens
+ * @param {number} budgetTokens
+ * @returns {string}
+ */
+const buildDirective = (template, estTokens, budgetTokens) => {
+  return template
+    .replace(/\{\{estTokens\}\}/g, String(estTokens))
+    .replace(/\{\{budgetTokens\}\}/g, String(budgetTokens));
+};
+harden(buildDirective);
+
+/**
  * @typedef {object} ProviderConstructorConfig
  * @property {string} host
  * @property {string} model
@@ -143,6 +222,9 @@ const resolveCurrentLeaf = async tree => {
  * @param {ProviderConstructorConfig | InjectedProviderConfig} providerConfig
  * @param {string} stateDir - per-agent state directory on disk
  * @param {string} agentName - agent name (used only for logging/`@host` ready)
+ * @param {object} [factoryRef] - the TavernFactory ref, for spawning/tearing
+ *   down probe sub-agents during summary verification (may be `undefined` in
+ *   tests where probes are mocked).
  * @returns {Promise<void>}
  */
 export const spawnTavernLoop = async (
@@ -151,6 +233,7 @@ export const spawnTavernLoop = async (
   providerConfig,
   stateDir,
   agentName,
+  factoryRef,
 ) => {
   const treePath = path.join(stateDir, 'tree.jsonl');
   const agentPath = path.join(stateDir, 'agent.json');
@@ -177,10 +260,12 @@ export const spawnTavernLoop = async (
    */
   let fsync = false;
   let modelOverride = null;
+  let enableSummarization = false;
   try {
     const startup = await loadAgent(agentPath);
     fsync = Boolean(startup.fsync);
     modelOverride = startup.model ?? null;
+    enableSummarization = Boolean(startup.enableSummarization);
   } catch (error) {
     console.error(
       `[tavern] agent.json unreadable at startup: ${
@@ -206,6 +291,12 @@ export const spawnTavernLoop = async (
   const tree = makeConversationTree(backend);
 
   let currentLeafId = await resolveCurrentLeaf(tree);
+
+  // Shared mutable leaf tracker. The agentic loop AND the summary tools
+  // (commitSummary) both read/write this — when commitSummary appends a
+  // summary node mid-loop, the loop's next step node parents from the
+  // summary node, keeping it on the path from leaf → root.
+  let sharedLeafId = currentLeafId;
 
   const state = await loadState(statePath);
 
@@ -236,6 +327,245 @@ export const spawnTavernLoop = async (
   localTools.set('dismiss', makeDismissTool(powers));
   localTools.set('exec', makeExecTool(powers));
   localTools.set('readChannel', makeReadChannelTool(powers));
+
+  // --- Context-management tools (summarization with LLM-verified commit) ---
+  //
+  // Disabled by default — enable via agent.json: `"enableSummarization": true`.
+  // When disabled, none of the summary tools are registered and the budget
+  // directive is not injected. See DESIGN.md §18.
+  //
+  // The LLM drives the flow: draftSummary → spawnProbeAgent → send probe questions
+  // → inspect replies → commitSummary (or discardSummary to retry). Committing or
+  // discarding auto-tears-down any spawned probe sub-agent. See DESIGN.md §18.
+  //
+  // `stagedSummary` is in-memory (lost on crash — the message re-runs, fine).
+  // `probeLocators` maps probe handle-locator → probe petname so handleTurn can
+  // format probe replies differently from normal inbox messages.
+
+  let stagedSummary = null;
+  /** @type {Map<string, string>} */
+  const probeLocators = new Map();
+
+  if (enableSummarization) {
+  /**
+   * Tear down a spawned probe sub-agent: cancel its formula, remove its
+   * petnames, clean up the temp probe state dir. Idempotent.
+   *
+   * @param {string} probeName
+   */
+  const teardownProbe = async probeName => {
+    const locator = [...probeLocators.entries()].find(([, n]) => n === probeName);
+    if (locator) {
+      probeLocators.delete(locator[0]);
+    }
+    // Best-effort teardown — probes are never pinned, so a stale probe is
+    // harmless if teardown fails; the destroy-agent CLI can clean up later.
+    try {
+      await E(powers).remove(probeName);
+    } catch {
+      // not registered in the parent's petstore, or already gone
+    }
+    if (factoryRef) {
+      try {
+        await E(factoryRef).destroyAgent(probeName);
+      } catch {
+        // already destroyed or factory unavailable
+      }
+    }
+    // rm -rf the temp probe state dir
+    const probeDir = path.join(stateDir, 'probes', probeName);
+    try {
+      await fsp.rm(probeDir, { recursive: true, force: true });
+    } catch {
+      // best-effort
+    }
+  };
+
+  localTools.set(
+    'draftSummary',
+    harden({
+      schema() {
+        return harden({
+          type: 'function',
+          function: {
+            name: 'draftSummary',
+            description:
+              'Stage a summary of the conversation so far. The summary REPLACES older turns in future context (once committed), so include the essential facts, persona traits, and ongoing threads. After drafting, use spawnProbeAgent to verify, then commitSummary or discardSummary.',
+            parameters: {
+              type: 'object',
+              properties: {
+                summary: {
+                  type: 'string',
+                  description: 'The summary text. Include key facts, decisions, and persona traits.',
+                },
+              },
+              required: ['summary'],
+            },
+          },
+        });
+      },
+      async execute(args) {
+        const { summary } = /** @type {{ summary: string }} */ (args);
+        if (!summary || !summary.trim()) {
+          return 'Error: summary text is required.';
+        }
+        stagedSummary = summary;
+        return `Draft staged (${summary.length} chars). Use spawnProbeAgent to verify, commitSummary to finalize, or discardSummary to retry.`;
+      },
+      help() {
+        return 'Stage a conversation summary for later commit. After drafting, verify with spawnProbeAgent, then commit or discard.';
+      },
+    }),
+  );
+
+  localTools.set(
+    'spawnProbeAgent',
+    harden({
+      schema() {
+        return harden({
+          type: 'function',
+          function: {
+            name: 'spawnProbeAgent',
+            description:
+              'Spawn a transient sub-agent whose system prompt is your staged draft summary (no other context). Send it questions via the send tool to verify whether the summary alone preserves the character\'s personality and key context. The probe agent announces itself when ready. Call this after draftSummary.',
+            parameters: { type: 'object', properties: {}, required: [] },
+          },
+        });
+      },
+      async execute(_args) {
+        if (!stagedSummary) {
+          return 'Error: no staged summary. Call draftSummary first.';
+        }
+        if (!factoryRef) {
+          return 'Error: no factory available (running in restricted mode).';
+        }
+        const probeName = `${agentName}-probe-${Date.now()}`;
+        const probeDir = path.join(stateDir, 'probes', probeName);
+        await fsp.mkdir(probeDir, { recursive: true });
+
+        // Write the probe's agent.json: systemPrompt = staged summary only
+        // (no PHI/depth — the test is "does the summary alone carry the
+        // persona?"). Reuse the parent's provider/model config.
+        const parentCfg = await loadAgent(agentPath).catch(() => ({}));
+        await saveJson(path.join(probeDir, 'agent.json'), harden({
+          schemaVersion: 1,
+          agentName: probeName,
+          characterName: agentName,
+          userName: 'Probe',
+          personaDescription: '',
+          systemPrompt: stagedSummary,
+          postHistoryInstructions: '',
+          depthPrompt: null,
+          promptInputs: { include: {}, useCardSystemPrompt: false, alternateGreetingIndex: 0 },
+          promptHash: '',
+          provider: parentCfg.provider || { name: 'default' },
+          model: parentCfg.model ?? null,
+          importedAt: new Date().toISOString(),
+          fsync: false,
+          contextBudgetTokens: CONTEXT_DEFAULTS.contextBudgetTokens,
+          summarizeAtRatio: CONTEXT_DEFAULTS.summarizeAtRatio,
+          summarizeDirective: CONTEXT_DEFAULTS.summarizeDirective,
+        }));
+
+        // Spawn the probe driver via the factory (not pinned — dies on restart)
+        const profileName = await E(factoryRef).createAgent(probeName, {
+          stateDir: probeDir,
+          pin: false,
+        });
+
+        // Register the probe in the parent's petstore so the LLM can `send`
+        // to it, and record its locator so handleTurn can format its replies.
+        const probeLocator = await E(factoryRef).locateAgent(probeName);
+        await E(powers).storeLocator(probeName, probeLocator);
+        probeLocators.set(probeLocator, probeName);
+
+        return `Probe agent "${probeName}" spawned (profile: ${profileName}). It will announce when ready. Use send(to: "${probeName}", strings: ["your question"]) to verify the summary. When satisfied, call commitSummary; to retry, call discardSummary. Either will tear down the probe.`;
+      },
+      help() {
+        return 'Spawn a transient verification sub-agent whose context is only your staged summary. Send it questions to check persona retention.';
+      },
+    }),
+  );
+
+  localTools.set(
+    'commitSummary',
+    harden({
+      schema() {
+        return harden({
+          type: 'function',
+          function: {
+            name: 'commitSummary',
+            description:
+              'Commit the staged summary as a new effective root in the conversation tree. Older turns are omitted from future context (but retained on disk for audit). Tears down any spawned probe agent. Call this after you have verified the summary via spawnProbeAgent.',
+            parameters: { type: 'object', properties: {}, required: [] },
+          },
+        });
+      },
+      async execute(_args) {
+        if (!stagedSummary) {
+          return 'Error: no staged summary to commit.';
+        }
+        // Append the summary node as a child of the shared leaf. Its
+        // metadata.summary flag marks it as the effective root for
+        // getEffectivePath. The agentic loop continues from the summary
+        // node, so its next step (tool results / final reply) is a CHILD
+        // of the summary — keeping the summary on the path leaf → root.
+        const summaryContent = `[Summary of prior conversation:]\n${stagedSummary}`;
+        const node = await tree.addNode(
+          sharedLeafId,
+          [{ role: 'system', content: summaryContent }],
+          { summary: true },
+        );
+        sharedLeafId = node.id;
+        currentLeafId = node.id;
+
+        // Tear down any spawned probe agent.
+        for (const [, probeName] of probeLocators) {
+          await teardownProbe(probeName);
+        }
+
+        const committed = stagedSummary;
+        stagedSummary = null;
+        return `Summary committed (${committed.length} chars). Older turns are omitted from future context; tree.jsonl retains them. Probe agent torn down.`;
+      },
+      help() {
+        return 'Commit the staged summary as the effective conversation root, omitting older turns from future context.';
+      },
+    }),
+  );
+
+  localTools.set(
+    'discardSummary',
+    harden({
+      schema() {
+        return harden({
+          type: 'function',
+          function: {
+            name: 'discardSummary',
+            description:
+              'Discard the staged summary and tear down any spawned probe agent. Call this to retry summarization with a fresh draft.',
+            parameters: { type: 'object', properties: {}, required: [] },
+          },
+        });
+      },
+      async execute(_args) {
+        const had = stagedSummary !== null;
+        stagedSummary = null;
+        // Tear down any spawned probe agent.
+        for (const [, probeName] of probeLocators) {
+          await teardownProbe(probeName);
+        }
+        return had
+          ? 'Draft discarded. Probe agent torn down. Call draftSummary to try again.'
+          : 'Nothing to discard (no staged summary).';
+      },
+      help() {
+        return 'Discard the staged summary and tear down any probe. Use to retry summarization.';
+      },
+    }),
+  );
+  // --- end context-management tools ---
+  }
 
   const processToolCalls = async (toolCalls, toolMap) => {
     /** @type {object[]} */
@@ -295,15 +625,17 @@ export const spawnTavernLoop = async (
    * @returns {Promise<string>} the final leaf id after the loop completes
    */
   const runAgenticLoop = async (toolSchemas, toolMap, leafNodeId, cfg) => {
-    let currentLeafIdLocal = leafNodeId;
     let currentSchemas = toolSchemas;
     let currentToolMap = toolMap;
     let continueLoop = true;
+    sharedLeafId = leafNodeId;
     while (continueLoop) {
-      const pathMessages = await tree.getPath(currentLeafIdLocal);
+      const pathMessages = await getEffectivePath(tree, sharedLeafId);
       const messages = assembleContext(cfg, pathMessages);
+      const est = estimateTokens(messages);
+
       console.log(
-        `[tavern] context has ${messages.length} messages, sending to LLM`,
+        `[tavern] context has ${messages.length} messages (≈${est} tokens), sending to LLM`,
       );
       const response = await chat(messages, currentSchemas);
 
@@ -324,11 +656,11 @@ export const spawnTavernLoop = async (
       const toolCalls = Array.isArray(rm.tool_calls) ? rm.tool_calls : [];
       if (toolCalls.length !== 0) {
         const toolResults = await processToolCalls(toolCalls, currentToolMap);
-        const stepNode = await tree.addNode(currentLeafIdLocal, [
+        const stepNode = await tree.addNode(sharedLeafId, [
           responseMessage,
           ...toolResults,
         ]);
-        currentLeafIdLocal = stepNode.id;
+        sharedLeafId = stepNode.id;
 
         const adopted = toolCalls.some(
           tc => /** @type {any} */ (tc).function?.name === 'adoptTool',
@@ -339,17 +671,17 @@ export const spawnTavernLoop = async (
           currentToolMap = refreshed.toolMap;
         }
       } else {
-        const finalNode = await tree.addNode(currentLeafIdLocal, [
+        const finalNode = await tree.addNode(sharedLeafId, [
           responseMessage,
         ]);
-        currentLeafIdLocal = finalNode.id;
+        sharedLeafId = finalNode.id;
         continueLoop = false;
         if (rm.content) {
           console.log(`[tavern] ${rm.content}`);
         }
       }
     }
-    return currentLeafIdLocal;
+    return sharedLeafId;
   };
 
   const initializeIntroducedTools = async () => {
@@ -473,7 +805,14 @@ export const spawnTavernLoop = async (
             textContent = `(${type || 'unknown'} message)`;
           }
 
-          const envelope = `[Inbox message #${number}] ${textContent}\n\nUse reply(messageNumber: ${number}, ...) to respond to this message.`;
+          // Probe replies are formatted differently so the LLM recognizes them
+          // as verification data, not a user to converse with.
+          const probeName = probeLocators.get(
+            /** @type {string} */ (fromId),
+          );
+          const envelope = probeName
+            ? `[Probe reply from ${probeName}] ${textContent}\n\nJudge whether the summary captured the persona, then commitSummary or discardSummary.`
+            : `[Inbox message #${number}] ${textContent}\n\nUse reply(messageNumber: ${number}, ...) to respond to this message.`;
 
           // Idempotency / crash recovery (§10):
           //  - if the current leaf is already this turn's user node, resume
@@ -555,6 +894,45 @@ export const spawnTavernLoop = async (
               await E(powers).reply(number, [errorMessage], [], []);
             } catch {
               // best-effort
+            }
+          }
+
+          // Post-turn budget check: if summarization is enabled and the
+          // context now exceeds the configured ratio, append a directive
+          // as the latest message in the tree and immediately run a
+          // self-turn (no inbox message) so the agent can summarize before
+          // the next user message arrives.
+          if (cfg.enableSummarization) {
+            // Re-discover tools (picks up any changes since the start of turn)
+            const refreshed = await discoverTools(powers, localTools);
+            const postPath = await getEffectivePath(tree, currentLeafId);
+            const postMessages = assembleContext(cfg, postPath);
+            const postEst = estimateTokens(postMessages);
+            const budget = cfg.contextBudgetTokens ?? CONTEXT_DEFAULTS.contextBudgetTokens;
+            const ratio = cfg.summarizeAtRatio ?? CONTEXT_DEFAULTS.summarizeAtRatio;
+            if (postEst > ratio * budget) {
+              const directiveTemplate = cfg.summarizeDirective ?? CONTEXT_DEFAULTS.summarizeDirective;
+              const directive = buildDirective(directiveTemplate, postEst, budget);
+              console.log(`[tavern] context over budget (≈${postEst}/${budget}), sending summarization directive as a self-turn`);
+              const directiveNode = await tree.addNode(
+                currentLeafId,
+                [{ role: 'system', content: directive }],
+                { directive: true },
+              );
+              currentLeafId = directiveNode.id;
+              sharedLeafId = directiveNode.id;
+              try {
+                replyTracker.sent = false;
+                currentLeafId = await runAgenticLoop(
+                  refreshed.schemas,
+                  refreshed.toolMap,
+                  directiveNode.id,
+                  cfg,
+                );
+              } catch (error2) {
+                const msg2 = error2 instanceof Error ? error2.message : String(error2);
+                console.error('[tavern] summarization self-turn error:', msg2);
+              }
             }
           }
         };
@@ -655,6 +1033,11 @@ export const make = async (guestPowers, _context) => {
       const agentId = await E(hostAgent).identify(profileName);
       await E(driverPowers).storeIdentifier('agent', agentId);
 
+      // Also store the factory's own self-ref so the driver's summary tools
+      // can spawn/tear down probe sub-agents via the factory.
+      const factoryLocator = await E(powers).locate('@self');
+      await E(driverPowers).storeLocator('tavern-factory', factoryLocator);
+
       // 4. Launch the driver caplet, passing the disk state dir + agent name
       //    via env so it can reload agent.json / tree.jsonl each turn.
       await E(hostAgent).makeUnconfined('@main', driverSpecifier, {
@@ -678,15 +1061,74 @@ export const make = async (guestPowers, _context) => {
     },
 
     /**
+     * Tear down a tavern agent: cancel its driver formula + forget its
+     * petnames. Idempotent. Used by the summary tools to tear down probe
+     * sub-agents, and also useful for manual agent cleanup.
+     *
+     * @param {string} name - the agent name (same as passed to createAgent)
+     * @returns {Promise<string>}
+     */
+    async destroyAgent(name) {
+      const guestName = name;
+      const profileName = `profile-for-${guestName}`;
+      const driverHandleName = `${name}-driver-handle`;
+      const driverProfileName = `profile-for-${driverHandleName}`;
+      const driverResultName = `${name}-driver`;
+
+      // Cancel the driver formula (stops the running caplet + its deps).
+      try {
+        await E(hostAgent).cancel(driverResultName);
+      } catch {
+        // already gone or never existed
+      }
+
+      // Forget all petnames (idempotent — has-guard each).
+      for (const petName of [
+        driverResultName,
+        `@pins/${driverResultName}`,
+        guestName,
+        profileName,
+        driverHandleName,
+        driverProfileName,
+      ]) {
+        if (await E(hostAgent).has(petName).catch(() => false)) {
+          await E(hostAgent).remove(petName).catch(() => {});
+        }
+      }
+
+      console.log(`[tavern-factory] Destroyed agent "${name}"`);
+      return `Destroyed "${name}"`;
+    },
+
+    /**
+     * Resolve an agent's handle locator. Used by the summary tools to
+     * register a probe sub-agent in the parent's petstore so the LLM can
+     * `send` to it.
+     *
+     * @param {string} name - the agent name
+     * @returns {Promise<string>}
+     */
+    async locateAgent(name) {
+      const profileName = `profile-for-${name}`;
+      return E(hostAgent).locate(profileName);
+    },
+
+    /**
      * @param {string} [methodName]
      * @returns {string}
      */
     help(methodName) {
       if (methodName === undefined) {
-        return 'Tavern factory: runs SillyTavern character cards as Endo agents with disk-backed conversation history. Use createAgent(name, { stateDir, providerName?, pin }) to bind a driver to an existing on-disk state dir.';
+        return 'Tavern factory: runs SillyTavern character cards as Endo agents with disk-backed conversation history. Use createAgent(name, { stateDir, providerName?, pin }) to bind a driver to an existing on-disk state dir. Use destroyAgent(name) to tear down an agent.';
       }
       if (methodName === 'createAgent') {
         return 'createAgent(name, { stateDir, providerName?, pin? }) — Bind a driver caplet to an existing on-disk state dir (run the importer first). Pass pin: true to survive daemon restarts. Returns the profile petname.';
+      }
+      if (methodName === 'destroyAgent') {
+        return 'destroyAgent(name) — Cancel the driver, forget petnames. Idempotent. Also used internally by summary verification to tear down probe sub-agents.';
+      }
+      if (methodName === 'locateAgent') {
+        return 'locateAgent(name) — Resolve an agent handle locator. Used internally to register probe sub-agents.';
       }
       return `No documentation for method "${methodName}".`;
     },

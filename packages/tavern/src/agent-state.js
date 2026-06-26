@@ -61,6 +61,17 @@ harden(saveJson);
  * @property {string} [cardPath]
  * @property {string} [chatPath]
  * @property {boolean} fsync
+ * @property {number} [contextBudgetTokens] - approximate token budget; driver
+ *   injects a 'consider summarizing' directive when context exceeds
+ *   summarizeAtRatio * contextBudgetTokens (default 100000).
+ * @property {number} [summarizeAtRatio] - fraction of the budget at which to
+ *   start suggesting summarization (default 0.75).
+ * @property {string} [summarizeDirective] - template text injected as a system
+ *   message when the budget is exceeded. Supports `{{estTokens}}` and
+ *   `{{budgetTokens}}` placeholders.
+ * @property {boolean} [enableSummarization] - when true, register the
+ *   draftSummary/spawnProbeAgent/commitSummary/discardSummary tools and
+ *   inject the budget directive. Disabled by default (false).
  */
 
 /**
@@ -70,6 +81,24 @@ harden(saveJson);
  */
 
 const STATE_SCHEMA_VERSION = 1;
+
+/**
+ * Default context-management config. Used when agent.json omits the
+ * corresponding fields (or when the driver can't read agent.json at all).
+ *
+ * @constant {{ contextBudgetTokens: number, summarizeAtRatio: number, summarizeDirective: string }}
+ */
+export const CONTEXT_DEFAULTS = harden({
+  contextBudgetTokens: 100_000,
+  summarizeAtRatio: 0.75,
+  summarizeDirective:
+    'Your context is large (≈{{estTokens}} tokens, budget {{budgetTokens}}). ' +
+    'Consider summarizing older turns: call draftSummary, then spawnProbeAgent ' +
+    'to verify the summary preserves the character\'s personality, then ' +
+    'commitSummary (or discardSummary to retry).',
+  enableSummarization: false,
+});
+
 
 /**
  * Load `state.json` (bookkeeping). Missing ⇒ fresh agent.

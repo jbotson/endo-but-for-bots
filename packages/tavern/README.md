@@ -230,14 +230,82 @@ config was stored under a name other than `default`.
 For each LLM call the driver assembles, from `agent.json`:
 
 1. `{ role: 'system', content: systemPrompt }` — the authoritative prompt
-   (a leading `system` message from the import-time portability root is
-   **stripped** — `agent.json` wins).
-2. `...tree.getPath(leafId)` — the recorded user/assistant/tool turns.
+   (the import-time portability root's system message is **skipped** —
+   `agent.json` wins).
+2. The effective conversation path (from the most recent committed summary
+   forward — see "Managing context" below).
 3. `depth_prompt` injected `depth` messages before the end (best-effort).
 4. `post_history_instructions` appended as an ephemeral `system` tail.
 
 Macros (`{{char}}`, `{{user}}`, `{{original}}`, `{{persona}}`) are expanded
 during import, not at runtime.
+
+## Managing context
+
+Without trimming, the conversation tree grows unbounded and the LLM call
+eventually exceeds the model's context window. Tavern solves this with
+**LLM-driven summarization**: the LLM drafts a summary of older turns,
+verifies it via a spawned sub-agent, and commits it when satisfied — the
+LLM is in control of when the summary takes effect, not the driver.
+
+### How it works
+
+Four tools are available to the agent every turn:
+
+| Tool | What it does |
+|------|-------------|
+| `draftSummary` | Stage a summary text in memory (replaces any prior draft). |
+| `spawnProbeAgent` | Spawn a transient sub-agent whose system prompt is only the staged summary. Send it questions via `send` to verify persona retention. |
+| `commitSummary` | Append the summary as a new effective root in the tree. Older turns are omitted from future context (but retained on disk). Auto-tears-down the probe. |
+| `discardSummary` | Drop the staged draft and tear down the probe. Use to retry. |
+
+The typical flow (multi-turn, driven by the LLM):
+
+```
+draftSummary({ summary: "..." })     → staged
+spawnProbeAgent()                     → probe petname
+send("seraphina-probe-123", ["Who are you?"]) → [existing send tool]
+(LLM ends turn; probe's reply arrives next turn)
+commitSummary()                       → committed, probe torn down
+```
+
+When a summary is committed, the driver's context assembly
+(`getEffectivePath`) walks the node chain from the current leaf → root and
+stops at the most recent `metadata.summary` node. Everything above it is
+omitted from the LLM input but **retained in `tree.jsonl`** for audit and
+re-import. On restart, the summary survives automatically (it's on disk).
+
+### Budget directive
+
+When the estimated token count (`JSON.stringify(messages).length / 4`)
+exceeds `summarizeAtRatio * contextBudgetTokens` **after a turn completes**,
+the driver appends the directive as a system message to the conversation
+tree and **immediately runs a new agentic loop** (a self-turn, with no
+inbox message) so the agent can summarize right away — it doesn't wait for
+the next user message. The directive text is configurable via
+`agent.json.summarizeDirective` (supports `{{estTokens}}` and
+`{{budgetTokens}}` placeholders).
+
+Configure via import flags:
+
+```bash
+node scripts/import-card.js --card ... --agent seraphina \
+  --context-budget 100000 --summarize-at 0.75 \
+  --summarize-directive 'Context is large ({{estTokens}}/{{budgetTokens}}). Consider summarizing.'
+```
+
+Or hand-edit `agent.json`. Defaults: budget 100000, ratio 0.75.
+
+### Tearing down agents
+
+```bash
+yarn destroy-agent seraphina
+# or: node scripts/destroy-agent.js seraphina --factory tavern-factory
+```
+
+`destroyAgent` cancels the driver formula and forgets petnames. It's also
+used internally by `commitSummary`/`discardSummary` to tear down probe
+sub-agents.
 
 ## Crash & restart behavior
 
@@ -305,6 +373,7 @@ packages/tavern/
 │   ├── import-all.js         # CLI: both
 │   ├── create-agent.js      # CLI: TavernFactory.createAgent over the daemon
 │   ├── rebind-provider.js   # CLI: re-bind a driver to a new LLM provider
+│   ├── destroy-agent.js    # CLI: TavernFactory.destroyAgent over the daemon
 │   └── args.js               # tiny argv parser
 └── test/                     # ava tests
 ```

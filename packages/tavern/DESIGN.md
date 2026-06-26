@@ -606,3 +606,117 @@ unbounded allocation, and verified against accidental corruption via CRC.
 ---
 
 _All open questions resolved. Design ready for implementation._
+
+---
+
+## 18. Context management (LLM-driven summarization)
+
+### Problem
+
+Without trimming, the conversation tree grows unbounded — every turn
+re-sends the **entire history** to the LLM (via `getEffectivePath`), and the
+provider eventually rejects the call with a context-length error. In the
+current error handling, this leaves the message undismissed and re-fails on
+every subsequent interaction, effectively bricking the agent.
+
+This is inherited from fae (its architecture doc states plainly: "Messages
+are appended but never truncated. No memory consolidation"). The v1 design
+doc (§1, §16) listed "token-budget trimming" as out of scope. This section
+closes that gap.
+
+### Design: LLM-verified commit
+
+The key requirement: **the LLM controls when a summary takes effect**, with
+verification before commit. This lets the LLM spin up a sub-agent whose
+only context is the draft summary and ask it questions to determine whether
+the character's personality has made it through — before committing.
+
+Four driver-internal tools (closures over loop state) are registered in
+`localTools` every turn:
+
+| Tool | Args | Behavior |
+|---|---|---|
+| `draftSummary` | `{ summary: string }` | Stages the text in memory (replaces any prior draft). Not persisted to disk — lost on crash, and the message re-runs. |
+| `spawnProbeAgent` | (none) | Creates a real Endo sub-agent via `E(factory).createAgent(...)` with `systemPrompt = stagedDraft` (no PHI/depth — the test is "does the summary alone carry the persona?"). The probe is **not pinned** (dies on restart). The probe's locator is recorded so `handleTurn` can format its replies differently from normal inbox messages. |
+| `commitSummary` | (none) | Appends a tree node with `metadata.summary = true` as a child of the current shared leaf. `getEffectivePath` stops at this node on future walks, omitting everything above it from LLM context. Auto-tears-down any spawned probe via `E(factory).destroyAgent(...)`. |
+| `discardSummary` | (none) | Drops the staged draft. Auto-tears-down any spawned probe. Use to retry. |
+
+The interaction is **multi-turn across normal inbox messages** (not
+synchronous polling):
+
+```
+Turn N:   draftSummary({ summary: "..." })
+Turn N:   spawnProbeAgent()
+Turn N:   send("seraphina-probe-xyz", ["Who are you?"])  [existing send tool]
+Turn N:   (LLM ends turn)
+Turn N+1: probe's reply arrives → formatted as "[Probe reply from ...]"
+          LLM judges persona retention
+Turn N+1: commitSummary() → summary committed, probe auto-torn-down
+```
+
+### Storage: the summary node
+
+A committed summary is a regular tree node appended to `tree.jsonl` with
+`metadata.summary = true` and a single `system` message
+(`"[Summary of prior conversation:]\n" + text`). `tree.jsonl` stays
+append-only and retains **everything** above the summary boundary (audit /
+re-importable). Only context assembly (`getEffectivePath`) truncates.
+
+### Context assembly: `getEffectivePath`
+
+Replaces the raw `tree.getPath(leafId)` call in `runAgenticLoop`. Walks
+nodes via `tree.getNode` from leaf → root. When it hits the most recent
+`metadata.summary === true` node, it stops and returns that node's
+messages + all descendants'. The import-time portability root (if present)
+is skipped — its system message is never the live prompt
+(`agent.json` is authoritative, as in §4).
+
+`assembleContext` then prepends `cfg.systemPrompt`, injects `depth_prompt`,
+appends PHI — unchanged.
+
+### `sharedLeafId` for mid-loop commit safety
+
+The agentic loop and the summary tools share a mutable `sharedLeafId`
+rather than the loop's local `currentLeafIdLocal`. When `commitSummary`
+appends a summary node mid-loop, the loop's next step node (tool results /
+final reply) parents from the summary node — keeping it on the path from
+leaf → root. Without this, the summary would land on a sibling branch
+parallel to the ongoing loop, and `getEffectivePath` would never reach it.
+
+### Budget directive
+
+After a turn completes (assistant reply sent, message dismissed), the
+driver estimates tokens (`JSON.stringify(messages).length / 4` — no
+tokenizer dep). If `enableSummarization` is true and the estimate exceeds
+`summarizeAtRatio * contextBudgetTokens`, the driver:
+
+1. Appends the directive as a `system` message node (with
+   `metadata.directive = true`) as a child of the current leaf.
+2. Immediately runs a new agentic loop starting from that node (a
+   **self-turn**, with no inbox message) so the agent can summarize right
+   away — it does not wait for the next user message.
+
+The directive text is configurable via `agent.json.summarizeDirective`
+(supports `{{estTokens}}` and `{{budgetTokens}}` placeholders). Defaults:
+budget 100000, ratio 0.75, `enableSummarization` false.
+
+### Factory additions
+
+- `createAgent` additionally stores the factory's `@self` locator as
+  `tavern-factory` in the driver's petstore, so the summary tools can
+  spawn/tear down probes.
+- **`destroyAgent(name)`** — cancels the driver formula, forgets petnames.
+  Used by `commitSummary`/`discardSummary` to tear down probes, and
+  generally useful for manual agent cleanup. Exposed via
+  `scripts/destroy-agent.js`.
+- **`locateAgent(name)`** — resolves an agent's handle locator. Used by
+  `spawnProbeAgent` to register the probe in the parent's petstore so
+  the LLM can `send` to it.
+
+### Crash & restart
+
+- Drafts are in-memory → lost on crash → message re-runs (fine).
+- Probes are unpinned → don't revive on restart; lingering petnames +
+  temp dirs are harmless (`destroy-agent` CLI handles manual cleanup).
+- Committed summaries are durable on `tree.jsonl` → `getEffectivePath`
+  truncates on restart automatically.

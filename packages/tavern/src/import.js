@@ -12,7 +12,7 @@ import { parseCardFile } from './card.js';
 import { resolvePrompt } from './prompt.js';
 import { parseChat } from './chat.js';
 import { makeDiskBackend } from './disk-backend.js';
-import { saveJson, appendImportLog, hashPrompt } from './agent-state.js';
+import { saveJson, appendImportLog, hashPrompt, CONTEXT_DEFAULTS } from './agent-state.js';
 import { validateAgentName, defaultStateDir } from './names.js';
 
 /**
@@ -28,6 +28,10 @@ import { validateAgentName, defaultStateDir } from './names.js';
  * @property {string} [providerName] - which stored llm-provider (default "default")
  * @property {string | null} [model] - optional provider model override
  * @property {boolean} [fsync]
+ * @property {number} [contextBudgetTokens] - approximate token budget (default 100000)
+ * @property {number} [summarizeAtRatio] - fraction of budget to trigger summarization (default 0.75)
+ * @property {string} [summarizeDirective] - configurable budget-directive text with `{{estTokens}}`/`{{budgetTokens}}` placeholders
+ * @property {boolean} [enableSummarization] - enable summarization tools + budget directive (default false)
  */
 
 /**
@@ -106,6 +110,10 @@ export const importCard = async opts => {
     cardPath: path.resolve(opts.card),
     chatPath: undefined,
     fsync: opts.fsync ?? false,
+    contextBudgetTokens: opts.contextBudgetTokens ?? CONTEXT_DEFAULTS.contextBudgetTokens,
+    summarizeAtRatio: opts.summarizeAtRatio ?? CONTEXT_DEFAULTS.summarizeAtRatio,
+    summarizeDirective: opts.summarizeDirective ?? CONTEXT_DEFAULTS.summarizeDirective,
+    enableSummarization: opts.enableSummarization ?? CONTEXT_DEFAULTS.enableSummarization,
   });
 
   await saveJson(agentPath, agentJson);
