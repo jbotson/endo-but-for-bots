@@ -331,7 +331,7 @@ Tavern also adds its own tools:
 |------|-------------|
 | `defineTool` | Define a reusable tool from JavaScript code. Runs in a sandboxed `Compartment` (same confinement as `exec`). Persists across restarts. |
 | `removeTool` | Remove a previously defined tool. |
-| `createSchedule` | Schedule a recurring job that sends an inbox message at a specified interval (minimum 60s). Built on the daemon's `makeTimer`. Persists across restarts. Use for periodic tasks (e.g. a few times a day), not sub-second timers. |
+| `createSchedule` | Schedule a recurring job that wakes the agent with a new turn at a specified interval (minimum 60s). Built on the daemon's `makeTimer`. Persists across restarts. Use for periodic tasks (e.g. a few times a day), not sub-second timers. |
 | `removeSchedule` | Cancel a scheduled job. |
 
 ### Scheduled jobs
@@ -347,11 +347,10 @@ createSchedule({
 → "Schedule 'morning-check' created: you will receive '...' every 360 minute(s)."
 ```
 
-On each tick, the agent receives the `message` text as a new inbox
-turn — it shows up in the conversation as `@self` and the agent
-processes it like any incoming message. Jobs persist across daemon
-restarts (the underlying timer is a durable daemon formula). Cancel
-with `removeSchedule("morning-check")`.
+On each tick, the agent receives the `message` text as a new conversation
+turn (appended directly to the tree — no inbox message needed). Jobs
+persist across daemon restarts (the underlying timer is a durable daemon
+formula). Cancel with `removeSchedule("morning-check")`.
 
 No filesystem-caplets ship in v1 — the agent's own state dir is managed by
 the driver and intentionally not exposed as a tool, to keep `tree.jsonl`

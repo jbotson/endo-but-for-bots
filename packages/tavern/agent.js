@@ -8,6 +8,7 @@ import { makeExo } from '@endo/exo';
 import { M } from '@endo/patterns';
 import { E } from '@endo/eventual-send';
 import { Far } from '@endo/far';
+import { makePromiseKit } from '@endo/promise-kit';
 import { passableAsJustin, makeMarshal } from '@endo/marshal';
 import { makeRefIterator } from '@endo/daemon/ref-reader.js';
 import { createProvider } from '@endo/lal/providers/index.js';
@@ -727,12 +728,28 @@ export const spawnTavernLoop = async (
   // --- Scheduled jobs (createSchedule / removeSchedule) ---
   //
   // Lets the agent schedule periodic "cron-style" jobs that wake it up with
-  // an inbox message at a configured interval (minimum 60s — this is for
+  // a new turn at a configured interval (minimum 60s — this is for
   // a few-times-a-day scheduling, not sub-second timers).
   //
   // Built on the daemon's makeTimer, but bridges the timer's callback-based
-  // onTick into an actual inbox message, so the agent's followMessages loop
-  // receives the tick naturally as a new turn.
+  // onTick into a local queue that the main loop races on — so the agent
+  // wakes up as a new turn without an inbox message (self-sends would be
+  // filtered by the fromId === selfLocator check in the message loop).
+
+  /**
+   * Local queue for scheduled ticks. When a timer fires, onTick enqueues here
+   * and resolves tickSignal — the main loop races on this so it wakes without
+   * an inbox message. This avoids the self-send filter (fromId === selfLocator)
+   * that would silently drop schedule messages routed through the inbox.
+   */
+  const pendingTicks = [];
+  let tickSignal = makePromiseKit();
+
+  const enqueueTick = (jobName, tickMessage, isCatchup = false) => {
+    const timestamp = new Date().toISOString();
+    pendingTicks.push({ jobName, message: tickMessage, isCatchup, timestamp });
+    tickSignal.resolve();
+  };
 
   /**
    * In-memory map of jobName → schedule info (timerPetName, message, interval,
@@ -781,9 +798,8 @@ export const spawnTavernLoop = async (
    * schedule is dropped silently.
    *
    * @param {object} hostRefArg - the narrowed TimerHost exo (from driver)
-   * @param {object} powersArg - the agent's EndoGuest powers
    */
-  const loadSchedules = async (hostRefArg, powersArg) => {
+  const loadSchedules = async hostRefArg => {
     if (!hostRefArg) return;
     const data = await loadJson(schedulesPath);
     if (!data || !Array.isArray(data) || data.length === 0) return;
@@ -803,7 +819,7 @@ export const spawnTavernLoop = async (
           async onTick(tick) {
             const tickMessage = `[Scheduled job "${jobName}" tick #${tick.tick} at ${tick.timestamp}]\n${message}`;
             try {
-              await E(powersArg).send('@self', [tickMessage], [], []);
+              enqueueTick(jobName, tickMessage);
             } catch (err) {
               console.error(
                 `[tavern] schedule "${jobName}" tick failed:`,
@@ -829,9 +845,11 @@ export const spawnTavernLoop = async (
           const catchupTimestamp = new Date(now).toISOString();
           console.log(`[tavern] Firing catch-up tick for schedule "${jobName}"`);
           try {
-            await E(powersArg).send('@self', [
+            enqueueTick(
+              jobName,
               `[Scheduled job "${jobName}" catch-up tick at ${catchupTimestamp}]\n${message}`,
-            ], [], []);
+              true,
+            );
           } catch {
             // best-effort
           }
@@ -854,7 +872,7 @@ export const spawnTavernLoop = async (
           function: {
             name: 'createSchedule',
             description:
-              'Schedule a recurring job that sends you an inbox message at a ' +
+              'Schedule a recurring job that wakes you with a new turn at a ' +
               'specified interval. Use this for periodic tasks (e.g. checking ' +
               'on something a few times a day), not sub-second timers. The ' +
               'minimum interval is 60 seconds. The job persists across daemon ' +
@@ -875,7 +893,7 @@ export const spawnTavernLoop = async (
                 message: {
                   type: 'string',
                   description:
-                    'The message text to send to your inbox on each tick. ' +
+                    'The message text to send to you on each tick. ' +
                     'This is what you (the agent) will receive as a new conversation turn.',
                 },
                 label: {
@@ -919,22 +937,21 @@ export const spawnTavernLoop = async (
           await E(hostRef).makeTimer(timerPetName, intervalMs, timerLabel);
           const timer = await E(hostRef).lookup([timerPetName]);
 
-          // Subscribe a callback that sends an inbox message to @self on
-          // each tick. The GC keeps this alive while the timer formula
-          // holds the reference (the timer is a persistent formula).
+          // Subscribe a callback that enqueues a tick to the local queue
+          // on each tick. The main loop races on the tick signal so it
+          // wakes up without an inbox message. The GC keeps this alive
+          // while the timer formula holds the reference (persistent formula).
           const subscriber = Far('ScheduleSubscriber', {
             async onTick(tick) {
               const tickMessage = `[Scheduled job "${jobName}" tick #${tick.tick} at ${tick.timestamp}]\n${message}`;
               try {
-                await E(powers).send('@self', [tickMessage], [], []);
+                enqueueTick(jobName, tickMessage);
               } catch (err) {
                 console.error(
                   `[tavern] schedule "${jobName}" tick failed:`,
                   err instanceof Error ? err.message : String(err),
                 );
               }
-              // Update lastRun so the next restart knows whether a catch-up
-              // is needed.
               touchSchedule(jobName).catch(() => {});
             },
           });
@@ -951,7 +968,7 @@ export const spawnTavernLoop = async (
         }
       },
       help() {
-        return 'Schedule a recurring job that sends an inbox message at a specified interval (minimum 60s). Persists across restarts. Use removeSchedule to cancel.';
+        return 'Schedule a recurring job that wakes you with a new turn at a specified interval (minimum 60s). Persists across restarts. Use removeSchedule to cancel.';
       },
     }),
   );
@@ -966,7 +983,7 @@ export const spawnTavernLoop = async (
             name: 'removeSchedule',
             description:
               'Cancel a scheduled job previously created with createSchedule. ' +
-              'Cancels the underlying daemon timer and stops further tick messages.',
+              'Cancels the underlying daemon timer and stops further ticks.',
             parameters: {
               type: 'object',
               properties: {
@@ -1005,7 +1022,7 @@ export const spawnTavernLoop = async (
         return `Schedule "${jobName}" cancelled.`;
       },
       help() {
-        return 'Cancel a scheduled job. Stops further tick messages and cancels the daemon timer.';
+        return 'Cancel a scheduled job. Stops further ticks and cancels the daemon timer.';
       },
     }),
   );
@@ -1514,7 +1531,7 @@ export const spawnTavernLoop = async (
   const runAgent = async () => {
     await initializeIntroducedTools();
     await loadDefinedTools();
-    await loadSchedules(hostRef, powers);
+    await loadSchedules(hostRef);
 
     await E(powers).send('@host', [`Tavern agent "${agentName}" ready.`], [], []);
 
@@ -1529,16 +1546,106 @@ export const spawnTavernLoop = async (
       : null;
 
       const messageIterator = makeRefIterator(E(powers).followMessages());
+
+    // Post-turn budget check, shared by handleTurn and handleScheduledTick.
+    // If summarization is enabled and the context exceeds the configured
+    // ratio, append a directive and run a self-turn.
+    const maybeRunSummarizationTurn = async cfg => {
+      if (!cfg.enableSummarization) return;
+      const refreshed = await discoverTools(powers, localTools);
+      const postPath = await getEffectivePath(tree, currentLeafId);
+      const postMessages = assembleContext(cfg, postPath);
+      const postEst = estimateTokens(postMessages);
+      const budget = cfg.contextBudgetTokens ?? CONTEXT_DEFAULTS.contextBudgetTokens;
+      const ratio = cfg.summarizeAtRatio ?? CONTEXT_DEFAULTS.summarizeAtRatio;
+      if (postEst > ratio * budget) {
+        const directiveTemplate = cfg.summarizeDirective ?? CONTEXT_DEFAULTS.summarizeDirective;
+        const directive = buildDirective(directiveTemplate, postEst, budget);
+        console.log(`[tavern] context over budget (≈${postEst}/${budget}), sending summarization directive as a self-turn`);
+        const directiveNode = await tree.addNode(
+          currentLeafId,
+          [{ role: 'system', content: directive }],
+          { directive: true },
+        );
+        currentLeafId = directiveNode.id;
+        sharedLeafId = directiveNode.id;
+        try {
+          replyTracker.sent = false;
+          currentLeafId = await runAgenticLoop(
+            refreshed.schemas,
+            refreshed.toolMap,
+            directiveNode.id,
+            cfg,
+          );
+        } catch (error2) {
+          const msg2 = error2 instanceof Error ? error2.message : String(error2);
+          console.error('[tavern] summarization self-turn error:', msg2);
+        }
+      }
+    };
+
+    // Handle a scheduled tick: append to tree and run agentic loop directly
+    // (no inbox message, no reply/dismiss — same pattern as the summarization
+    // self-turn).
+    const handleScheduledTick = async tick => {
+      let cfg;
+      try {
+        cfg = await loadAgent(agentPath);
+      } catch (error) {
+        const msg = error instanceof Error ? error.message : String(error);
+        console.error('[tavern] agent.json unreadable:', msg);
+        return;
+      }
+
+      const { jobName, message: tickMessage } = tick;
+      console.log(`[tavern] Scheduled tick from "${jobName}"`);
+      const { schemas: toolSchemas, toolMap } = await discoverTools(
+        powers,
+        localTools,
+      );
+      console.log(`[tavern] ${toolSchemas.length} tools available (${[...toolMap.keys()].join(', ')})`);
+
+      const node = await tree.addNode(
+        currentLeafId,
+        [{ role: 'user', content: tickMessage }],
+        { scheduled: true, jobName },
+      );
+      currentLeafId = node.id;
+      if (cfg.fsync) {
+        fsync = true;
+      }
+
+      try {
+        replyTracker.sent = false;
+        currentLeafId = await runAgenticLoop(toolSchemas, toolMap, node.id, cfg);
+      } catch (error) {
+        const errorMessage =
+          error instanceof Error ? error.message : String(error);
+        console.error(`[tavern] scheduled tick "${jobName}" error:`, errorMessage);
+      }
+
+      await maybeRunSummarizationTurn(cfg);
+    };
+
     console.log(`[tavern] inbox iterator acquired; awaiting messages`);
     for (;;) {
+      // Reset tick signal when the queue is empty so the next enqueueTick
+      // can wake us.
+      if (pendingTicks.length === 0) {
+        tickSignal = makePromiseKit();
+      }
       const nextMessage = messageIterator.next();
       console.log(`[tavern] awaiting next message...`);
       const raced = cancelledSignal
         ? await Promise.race([
             cancelledSignal,
-            nextMessage.then(result => ({ cancelled: false, result })),
+            nextMessage.then(result => ({ cancelled: false, type: 'message', result })),
+            tickSignal.promise.then(() => ({ cancelled: false, type: 'tick' })),
           ])
-        : { cancelled: false, result: await nextMessage };
+        : await Promise.race([
+            nextMessage.then(result => ({ cancelled: false, type: 'message', result })),
+            tickSignal.promise.then(() => ({ cancelled: false, type: 'tick' })),
+          ]);
       if (raced.cancelled) {
         try {
           await messageIterator.return?.();
@@ -1547,6 +1654,12 @@ export const spawnTavernLoop = async (
         }
         break;
       }
+      if (raced.type === 'tick') {
+        while (pendingTicks.length > 0) {
+          const tick = pendingTicks.shift();
+          await handleScheduledTick(tick);
+        }
+      } else {
       const { value: message, done } = raced.result;
       if (done) {
         break;
@@ -1705,41 +1818,10 @@ export const spawnTavernLoop = async (
           // as the latest message in the tree and immediately run a
           // self-turn (no inbox message) so the agent can summarize before
           // the next user message arrives.
-          if (cfg.enableSummarization) {
-            // Re-discover tools (picks up any changes since the start of turn)
-            const refreshed = await discoverTools(powers, localTools);
-            const postPath = await getEffectivePath(tree, currentLeafId);
-            const postMessages = assembleContext(cfg, postPath);
-            const postEst = estimateTokens(postMessages);
-            const budget = cfg.contextBudgetTokens ?? CONTEXT_DEFAULTS.contextBudgetTokens;
-            const ratio = cfg.summarizeAtRatio ?? CONTEXT_DEFAULTS.summarizeAtRatio;
-            if (postEst > ratio * budget) {
-              const directiveTemplate = cfg.summarizeDirective ?? CONTEXT_DEFAULTS.summarizeDirective;
-              const directive = buildDirective(directiveTemplate, postEst, budget);
-              console.log(`[tavern] context over budget (≈${postEst}/${budget}), sending summarization directive as a self-turn`);
-              const directiveNode = await tree.addNode(
-                currentLeafId,
-                [{ role: 'system', content: directive }],
-                { directive: true },
-              );
-              currentLeafId = directiveNode.id;
-              sharedLeafId = directiveNode.id;
-              try {
-                replyTracker.sent = false;
-                currentLeafId = await runAgenticLoop(
-                  refreshed.schemas,
-                  refreshed.toolMap,
-                  directiveNode.id,
-                  cfg,
-                );
-              } catch (error2) {
-                const msg2 = error2 instanceof Error ? error2.message : String(error2);
-                console.error('[tavern] summarization self-turn error:', msg2);
-              }
-            }
-          }
+          await maybeRunSummarizationTurn(cfg);
         };
         await handleTurn();
+      }
       }
     }
   };
