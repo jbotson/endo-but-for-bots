@@ -1628,22 +1628,28 @@ export const spawnTavernLoop = async (
     };
 
     console.log(`[tavern] inbox iterator acquired; awaiting messages`);
+    let pendingMessage = null;
     for (;;) {
       // Reset tick signal when the queue is empty so the next enqueueTick
       // can wake us.
       if (pendingTicks.length === 0) {
         tickSignal = makePromiseKit();
       }
-      const nextMessage = messageIterator.next();
+      // Reuse the previous message promise if it wasn't consumed (e.g. a
+      // tick won the race and the message may have resolved during tick
+      // processing). Calling .next() again would skip the resolved value.
+      if (!pendingMessage) {
+        pendingMessage = messageIterator.next();
+      }
       console.log(`[tavern] awaiting next message...`);
       const raced = cancelledSignal
         ? await Promise.race([
             cancelledSignal,
-            nextMessage.then(result => ({ cancelled: false, type: 'message', result })),
+            pendingMessage.then(result => ({ cancelled: false, type: 'message', result })),
             tickSignal.promise.then(() => ({ cancelled: false, type: 'tick' })),
           ])
         : await Promise.race([
-            nextMessage.then(result => ({ cancelled: false, type: 'message', result })),
+            pendingMessage.then(result => ({ cancelled: false, type: 'message', result })),
             tickSignal.promise.then(() => ({ cancelled: false, type: 'tick' })),
           ]);
       if (raced.cancelled) {
@@ -1659,7 +1665,10 @@ export const spawnTavernLoop = async (
           const tick = pendingTicks.shift();
           await handleScheduledTick(tick);
         }
+        // Keep pendingMessage — it may have resolved during tick processing,
+        // in which case the next iteration's race resolves it immediately.
       } else {
+        pendingMessage = null;
       const { value: message, done } = raced.result;
       if (done) {
         break;
