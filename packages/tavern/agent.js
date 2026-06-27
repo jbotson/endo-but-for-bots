@@ -29,7 +29,6 @@ import {
   makeReplyTool,
   makeListMessagesTool,
   makeDismissTool,
-  makeExecTool,
   makeReadChannelTool,
 } from './src/tool-makers.js';
 import { makeDiskBackend } from './src/disk-backend.js';
@@ -330,7 +329,175 @@ export const spawnTavernLoop = async (
   );
   localTools.set('listMessages', makeListMessagesTool(powers));
   localTools.set('dismiss', makeDismissTool(powers));
-  localTools.set('exec', makeExecTool(powers));
+
+  // Tavern's enhanced exec: same as fae's, but with makeExo, M, and readOnly
+  // as additional endowments, so the agent can create CapTP-safe remotables,
+  // interface guards, and read-only attenuations of existing capabilities.
+  // The agent gets makeExo/M (pure minting/validation, no raw capability) and
+  // a readOnly helper that creates recursively-attenuated facets over
+  // petstore values (directories return read-only views, not raw objects).
+
+  /**
+   * Create a read-only exo facet over a petstore value. For directories,
+   * exposes only has/list/lookup/help, with lookup recursively wrapping
+   * returned values. For files, exposes only text/json/help. For plain
+   * pass-by-copy values (JSON), returns as-is (already immutable).
+   *
+   * @param {object} obj - the raw petstore value (an ERef)
+   * @param {{ includeUnknown?: boolean }} [opts] - if true, unknown object types
+   *   are passed through as-is (dangerous — may expose write capabilities).
+   *   Defaults to false: unknown types throw an error so the agent can
+   *   decide whether to override.
+   * @returns {Promise<object>} a narrowed, read-only exo facet
+   */
+  const readOnly = async (obj, opts = {}) => {
+    if (obj === null || typeof obj !== 'object') return obj;
+
+    // Probe the object's CapTP method names to detect its type.
+    const getMethodNames = '__getMethodNames__'; // eslint-disable-line no-underscore-dangle
+    let methodNames;
+    try {
+      methodNames = await E(obj)[getMethodNames]();
+    } catch {
+      // Not a Far/exo object — pass-by-copy, already immutable.
+      return obj;
+    }
+    if (!Array.isArray(methodNames)) return obj;
+
+    const isDirectory = methodNames.includes('has') && methodNames.includes('lookup');
+    const isFile = methodNames.includes('text') || methodNames.includes('json');
+
+    if (isDirectory) {
+      return makeExo('ReadOnlyDirectory', M.interface('ReadOnlyDirectory', {
+        has: M.call().rest(M.any()).returns(M.promise()),
+        list: M.call().rest(M.any()).returns(M.promise()),
+        lookup: M.call(M.any()).returns(M.promise()),
+        help: M.call().optional(M.string()).returns(M.string()),
+      }), {
+        has: (...namePath) => E(obj).has(...namePath),
+        list: (...namePath) => E(obj).list(...namePath),
+        lookup: async name => {
+          const inner = await E(obj).lookup(name);
+          // Recursively attenuate: nested directories, files, and plain
+          // values all go through readOnly, so the probe never gets a raw
+          // modifiable object through traversal.
+          return readOnly(inner, opts);
+        },
+        help: methodName =>
+          methodName === undefined
+            ? 'Read-only directory view (has, list, lookup). Modifications are not available.'
+            : `Read-only: ${methodName}`,
+      });
+    }
+
+    if (isFile) {
+      const fileMethods = {};
+      if (methodNames.includes('text')) {
+        fileMethods.text = () => E(obj).text();
+      }
+      if (methodNames.includes('json')) {
+        fileMethods.json = () => E(obj).json();
+      }
+      fileMethods.help = methodName =>
+        methodName === undefined
+          ? 'Read-only file view (text, json). Modifications are not available.'
+          : `Read-only: ${methodName}`;
+      return makeExo('ReadOnlyFile', M.interface('ReadOnlyFile', M.call().rest(M.any()).returns(M.any())), fileMethods);
+    }
+
+    // Unknown object type — this could be anything, including objects with
+    // write capabilities (storeIdentifier, remove, send, etc.). Default to
+    // throwing so the agent consciously decides to override via
+    // { includeUnknown: true }.
+    if (opts.includeUnknown) {
+      console.warn('[tavern] readOnly: passing through unknown object type — may expose write capabilities');
+      return obj;
+    }
+    throw new Error(
+      `readOnly: unknown object type with methods [${methodNames.join(', ')}]. ` +
+      'This object may have write capabilities. ' +
+      'Pass { includeUnknown: true } to readOnly() if you intentionally want to share it unattenuated.',
+    );
+  };
+
+  localTools.set(
+    'exec',
+    harden({
+      schema() {
+        return harden({
+          type: 'function',
+          function: {
+            name: 'exec',
+            description:
+              'Execute JavaScript code with access to your guest powers. ' +
+              'The code runs as an async function body (top-level await works). ' +
+              'Return a value to get it as the tool result.\n\n' +
+              'Available parameters:\n' +
+              '- powers: your guest interface (adopt, reply, send, lookup, list, etc.)\n' +
+              '- E: eventual send — use E(ref).method() for all remote calls\n' +
+              '- harden: freeze objects for safe passing\n' +
+              '- console: for logging\n' +
+              '- makeExo: create a CapTP-safe remotable with an interface guard\n' +
+              '- M: pattern library for interface guards\n' +
+              '- readOnly: create a read-only, recursively-attenuated facet over a ' +
+              'petstore value (directories return read-only views on lookup, not raw objects). ' +
+              'Throws if the object type is unknown (not a directory or file) — pass ' +
+              '{ includeUnknown: true } as the second argument to override, but be aware ' +
+              'this may pass through an object with write capabilities.\n\n' +
+              'Example — create a read-only view of a directory and send it to a probe:\n' +
+              '```\n' +
+              'const dir = await E(powers).lookup("my-directory");\n' +
+              'const roDir = await readOnly(dir);\n' +
+              'await E(powers).storeValue(roDir, "temp-shared");\n' +
+              'await E(powers).send("probe-name", ["Here is @readonly-dir"], ["readonly-dir"], ["temp-shared"]);\n' +
+              'return "Shared read-only directory with probe";\n' +
+              '```',
+            parameters: {
+              type: 'object',
+              properties: {
+                code: {
+                  type: 'string',
+                  description:
+                    'JavaScript code to execute. Runs as an async function body. ' +
+                    'Use E(powers).method() for guest operations. Return a result.',
+                },
+              },
+              required: ['code'],
+            },
+          },
+        });
+      },
+      async execute(args) {
+        const { code } = /** @type {{ code: string }} */ (args);
+        if (!code) {
+          throw new Error('code is required');
+        }
+        const wrappedSource = `(async (powers, E, harden, console, makeExo, M, readOnly) => {\n${code}\n})`;
+        const c = new Compartment({
+          __options__: true,
+          globals: { BigInt },
+        });
+        const fn = c.evaluate(wrappedSource);
+        const result = await fn(powers, E, harden, console, makeExo, M, readOnly);
+        if (result === undefined) {
+          return 'done (no return value)';
+        }
+        try {
+          return JSON.stringify(result, null, 2);
+        } catch {
+          return String(result);
+        }
+      },
+      help() {
+        return (
+          'Execute JavaScript code with powers, E, harden, console, makeExo, M, ' +
+          'and readOnly (read-only facet creation). Use for multi-step operations ' +
+          'and creating CapTP-safe attenuated capabilities.'
+        );
+      },
+    }),
+  );
+
   localTools.set('readChannel', makeReadChannelTool(powers));
 
   // --- Self-defined tools (defineTool / removeTool) ---
