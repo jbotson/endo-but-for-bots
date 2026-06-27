@@ -1113,7 +1113,12 @@ export const spawnTavernLoop = async (
           function: {
             name: 'spawnProbeAgent',
             description:
-              'Spawn a transient sub-agent whose system prompt is your staged draft summary (no other context). Send it questions via the send tool to verify whether the summary alone preserves the character\'s personality and key context. The probe agent announces itself when ready. Call this after draftSummary.',
+              'Spawn a transient sub-agent whose context mirrors what the parent ' +
+              'will have after commitSummary: the same system prompt, PHI, and ' +
+              'depth_prompt from agent.json, plus the staged summary as the effective ' +
+              'conversation root. Send it questions via `send` to verify whether the ' +
+              'summary preserves the character\'s personality in context. Use ' +
+              'readProbeTrace to inspect its full thinking. Call this after draftSummary.',
             parameters: { type: 'object', properties: {}, required: [] },
           },
         });
@@ -1129,29 +1134,47 @@ export const spawnTavernLoop = async (
         const probeDir = path.join(stateDir, 'probes', probeName);
         await fsp.mkdir(probeDir, { recursive: true });
 
-        // Write the probe's agent.json: systemPrompt = staged summary only
-        // (no PHI/depth — the test is "does the summary alone carry the
-        // persona?"). Reuse the parent's provider/model config.
+        // Write the probe's agent.json. The probe inherits the parent's
+        // systemPrompt, PHI, and depthPrompt — exactly what the parent will
+        // have after commitSummary (those are in agent.json, not in the tree,
+        // so they survive summarization). The summary is seeded as the first
+        // tree node (the effective root), matching what commitSummary appends.
         const parentCfg = await loadAgent(agentPath).catch(() => ({}));
         await saveJson(path.join(probeDir, 'agent.json'), harden({
           schemaVersion: 1,
           agentName: probeName,
           characterName: agentName,
           userName: 'Probe',
-          personaDescription: '',
-          systemPrompt: stagedSummary,
-          postHistoryInstructions: '',
-          depthPrompt: null,
+          personaDescription: parentCfg.personaDescription || '',
+          systemPrompt: parentCfg.systemPrompt || '',
+          postHistoryInstructions: parentCfg.postHistoryInstructions || '',
+          depthPrompt: parentCfg.depthPrompt || null,
           promptInputs: { include: {}, useCardSystemPrompt: false, alternateGreetingIndex: 0 },
-          promptHash: '',
+          promptHash: parentCfg.promptHash || '',
           provider: parentCfg.provider || { name: 'default' },
           model: parentCfg.model ?? null,
           importedAt: new Date().toISOString(),
           fsync: false,
+          enableSummarization: false,
           contextBudgetTokens: CONTEXT_DEFAULTS.contextBudgetTokens,
           summarizeAtRatio: CONTEXT_DEFAULTS.summarizeAtRatio,
           summarizeDirective: CONTEXT_DEFAULTS.summarizeDirective,
         }));
+
+        // Seed the probe's tree with the summary as the effective root —
+        // a system message with metadata.summary = true, exactly matching
+        // what commitSummary appends to the parent's tree. The probe's
+        // context will then be: [parent's systemPrompt, summary node, ...]
+        // — identical to the parent's post-commit state.
+        const probeTreePath = path.join(probeDir, 'tree.jsonl');
+        const probeBackend = await makeDiskBackend(probeTreePath, { fsync: false });
+        const probeTree = makeConversationTree(probeBackend);
+        const summaryContent = `[Summary of prior conversation:]\n${stagedSummary}`;
+        await probeTree.addNode(
+          null,
+          [{ role: 'system', content: summaryContent }],
+          { summary: true },
+        );
 
         // Spawn the probe driver via the factory (not pinned — dies on restart)
         const profileName = await E(factoryRef).createAgent(probeName, {
