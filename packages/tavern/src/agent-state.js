@@ -72,6 +72,10 @@ harden(saveJson);
  * @property {boolean} [enableSummarization] - when true, register the
  *   draftSummary/spawnProbeAgent/commitSummary/discardSummary tools and
  *   inject the budget directive. Disabled by default (false).
+ * @property {number} [maxMessageChars] - maximum characters for any single
+ *   message (LLM response or tool result) before it is truncated. Prevents
+ *   runaway outputs (e.g. infinite loops) from blowing up the context window
+ *   and tree.jsonl. Default 50000 (~12K tokens).
  */
 
 /**
@@ -97,6 +101,7 @@ export const CONTEXT_DEFAULTS = harden({
     'to verify the summary preserves the character\'s personality, then ' +
     'commitSummary (or discardSummary to retry).',
   enableSummarization: false,
+  maxMessageChars: 50_000,
 });
 
 

@@ -198,6 +198,44 @@ const buildDirective = (template, estTokens, budgetTokens) => {
 harden(buildDirective);
 
 /**
+ * Truncate any message whose `content` string exceeds `maxChars`. The
+ * truncated content is replaced with the first `maxChars` bytes plus a
+ * visible notice so the LLM knows the output was too large. This prevents
+ * runaway outputs (e.g. infinite loops) from blowing up the context window
+ * and tree.jsonl.
+ *
+ * Operates on a shallow copy of each message; the originals are not mutated.
+ *
+ * @param {object[]} messages
+ * @param {number} maxChars
+ * @returns {object[]}
+ */
+const truncateMessages = (messages, maxChars) => {
+  if (!maxChars || maxChars <= 0) return messages;
+  let truncated = false;
+  const result = messages.map(msg => {
+    const content = /** @type {any} */ (msg).content;
+    if (typeof content === 'string' && content.length > maxChars) {
+      truncated = true;
+      const originalLen = content.length;
+      return {
+        ...msg,
+        content:
+          `${content.slice(0, maxChars)}\n\n[... output truncated: was ${originalLen} chars, limit is ${maxChars} ...]`,
+      };
+    }
+    return msg;
+  });
+  if (truncated) {
+    console.warn(
+      `[tavern] one or more messages truncated to ${maxChars} chars`,
+    );
+  }
+  return result;
+};
+harden(truncateMessages);
+
+/**
  * @typedef {object} ProviderConstructorConfig
  * @property {string} host
  * @property {string} model
@@ -1465,10 +1503,12 @@ export const spawnTavernLoop = async (
       const toolCalls = Array.isArray(rm.tool_calls) ? rm.tool_calls : [];
       if (toolCalls.length !== 0) {
         const toolResults = await processToolCalls(toolCalls, currentToolMap);
-        const stepNode = await tree.addNode(sharedLeafId, [
-          responseMessage,
-          ...toolResults,
-        ]);
+        const maxChars = cfg.maxMessageChars ?? CONTEXT_DEFAULTS.maxMessageChars;
+        const nodeMessages = truncateMessages(
+          [responseMessage, ...toolResults],
+          maxChars,
+        );
+        const stepNode = await tree.addNode(sharedLeafId, nodeMessages);
         sharedLeafId = stepNode.id;
 
         const needsRediscovery = toolCalls.some(
@@ -1484,9 +1524,9 @@ export const spawnTavernLoop = async (
           currentToolMap = refreshed.toolMap;
         }
       } else {
-        const finalNode = await tree.addNode(sharedLeafId, [
-          responseMessage,
-        ]);
+        const maxChars = cfg.maxMessageChars ?? CONTEXT_DEFAULTS.maxMessageChars;
+        const nodeMessages = truncateMessages([responseMessage], maxChars);
+        const finalNode = await tree.addNode(sharedLeafId, nodeMessages);
         sharedLeafId = finalNode.id;
         continueLoop = false;
         if (rm.content) {
