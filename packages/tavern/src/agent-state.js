@@ -76,6 +76,10 @@ harden(saveJson);
  *   message (LLM response or tool result) before it is truncated. Prevents
  *   runaway outputs (e.g. infinite loops) from blowing up the context window
  *   and tree.jsonl. Default 50000 (~12K tokens).
+ * @property {number} [execTimeoutMs] - timeout for exec and defined tool
+ *   execution. If a tool's code doesn't complete within this duration, it is
+ *   rejected with a timeout error that the LLM sees as the tool result.
+ *   Default 30000 (30 seconds). Set to 0 to disable.
  */
 
 /**
@@ -102,6 +106,7 @@ export const CONTEXT_DEFAULTS = harden({
     'commitSummary (or discardSummary to retry).',
   enableSummarization: false,
   maxMessageChars: 50_000,
+  execTimeoutMs: 30_000,
 });
 
 

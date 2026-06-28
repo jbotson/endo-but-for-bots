@@ -1,5 +1,6 @@
 // @ts-nocheck - E() generics don't work well with JSDoc types for remote objects
 /* eslint-disable no-await-in-loop, @endo/restrict-comparison-operands */
+/* global setTimeout, clearTimeout */
 
 import path from 'node:path';
 import fsp from 'node:fs/promises';
@@ -236,6 +237,35 @@ const truncateMessages = (messages, maxChars) => {
 harden(truncateMessages);
 
 /**
+ * Race a promise against a timeout. If the timeout fires first, rejects with
+ * a descriptive error. If `ms` is 0 or negative, returns the promise as-is
+ * (timeout disabled).
+ *
+ * Note: this only catches _async_ hangs (e.g. an `await` that never resolves,
+ * an infinite `while(true) { await ... }` loop). A purely synchronous
+ * infinite loop blocks the event loop and cannot be interrupted by a timer.
+ *
+ * @template T
+ * @param {Promise<T>} promise
+ * @param {number} ms
+ * @returns {Promise<T>}
+ */
+const withTimeout = (promise, ms) => {
+  if (!ms || ms <= 0) return promise;
+  let timer;
+  const timeout = new Promise((_, reject) => {
+    timer = setTimeout(
+      () => reject(new Error(`exec timed out after ${ms}ms`)),
+      ms,
+    );
+  });
+  return Promise.race([promise, timeout]).finally(() => {
+    clearTimeout(timer);
+  });
+};
+harden(withTimeout);
+
+/**
  * @typedef {object} ProviderConstructorConfig
  * @property {string} host
  * @property {string} model
@@ -304,11 +334,13 @@ export const spawnTavernLoop = async (
   let fsync = false;
   let modelOverride = null;
   let enableSummarization = false;
+  let execTimeoutMs = CONTEXT_DEFAULTS.execTimeoutMs;
   try {
     const startup = await loadAgent(agentPath);
     fsync = Boolean(startup.fsync);
     modelOverride = startup.model ?? null;
     enableSummarization = Boolean(startup.enableSummarization);
+    execTimeoutMs = startup.execTimeoutMs ?? CONTEXT_DEFAULTS.execTimeoutMs;
   } catch (error) {
     console.error(
       `[tavern] agent.json unreadable at startup: ${
@@ -517,7 +549,10 @@ export const spawnTavernLoop = async (
           globals: { BigInt },
         });
         const fn = c.evaluate(wrappedSource);
-        const result = await fn(powers, E, harden, console, makeExo, M, readOnly);
+        const result = await withTimeout(
+          fn(powers, E, harden, console, makeExo, M, readOnly),
+          execTimeoutMs,
+        );
         if (result === undefined) {
           return 'done (no return value)';
         }
@@ -577,7 +612,10 @@ export const spawnTavernLoop = async (
           globals: { BigInt },
         });
         const fn = c.evaluate(wrappedSource);
-        const result = await fn(args, powersArg, E, harden, console);
+        const result = await withTimeout(
+          fn(args, powersArg, E, harden, console),
+          execTimeoutMs,
+        );
         if (result === undefined) {
           return 'done (no return value)';
         }
