@@ -31,6 +31,7 @@
     "destroy-agent": "node scripts/destroy-agent.js",
     "grant-scheduling": "node scripts/grant-scheduling.js",
     "grant-factory": "node scripts/grant-factory.js",
+    "repair-tree": "node scripts/repair-tree.js",
     "import-card": "node scripts/import-card.js",
     "import-chat": "node scripts/import-chat.js",
     "import-all": "node scripts/import-all.js",
